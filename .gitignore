@@ -1,4 +1,8 @@
 *.swp
+# Env files with secrets (keep .env.example tracked)
+.env
+.env.*
+!.env.example
 __pycache__
 .pytest_cache
 .venv

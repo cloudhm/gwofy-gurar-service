@@ -1,19 +1,10 @@
-from aws_cdk import (
-    # Duration,
-    Stack,
-    # aws_sqs as sqs,
-)
-from constructs import Construct
+"""
+Legacy module name — stacks are split into `storage_stack` and `api_stack`.
 
-class GwofyGuardServiceStack(Stack):
+Deploy via `app.py` (GwofyGuardStorage + GwofyGuardApi).
+"""
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
-        super().__init__(scope, construct_id, **kwargs)
+from gwofy_guard_service.api_stack import ApiStack
+from gwofy_guard_service.storage_stack import StorageStack
 
-        # The code that defines your stack goes here
-
-        # example resource
-        # queue = sqs.Queue(
-        #     self, "GwofyGuardServiceQueue",
-        #     visibility_timeout=Duration.seconds(300),
-        # )
+__all__ = ["ApiStack", "StorageStack"]
