@@ -252,7 +252,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 可选环境变量（CDK 写入 Worker / 商户 Lambda，也可用 `-c` context）：`ORDER_PROTECTION_TAG`（默认 `gwofy-shipping-protection`）— 仅用于在 **本系统 DynamoDB 订单镜像** 上写入 `sync_tags`（**不会**调用 Shopify 修改商户订单）。
 
-激活时 Worker 会在商户店创建 **UNLISTED** 运费险商品，**handle** 固定为 **`GWOFY-SHIPPING-PROTECTION-QAQWER`**，变体 **Plan = S0001…S0098**，每变体 **独立 SKU**（默认与 `plan_code` 相同）。档位与 **USD 加价**、**购物车保额区间**（默认按 0–9000 USD 均分 98 档）由全局 **`PUT /admin/config/pricing-model`** 的 `tiers` 定义（字段 `plan_code`、`min_usd`、`max_usd`、`price_usd`，可选 `sku` 覆盖库存 SKU）。首装缺省会种子 **98 档** 与你们提供的默认价表一致。
+激活时 Worker 会在商户店创建 **UNLISTED** 运费险商品，**handle** 固定为 **`GWOFY-SHIPPING-PROTECTION-QAQWER`**，变体 **Plan = S0001…S0098**，每变体 **SKU = `plan_code`**。全局 **`PUT /admin/config/pricing-model`** 的 `tiers` 每条仅需 **`plan_code`**（可与 **`sku` 二选一作为别名，二者不得冲突）、**`price_usd`**；不写购物车区间——按 **数组顺序** 将「有效最大保额（USD）」均分为 `len(tiers)` 段并映射档位。**禁止删除** Dynamo 里曾出现过的 `plan_code`（仅可加档或改价）。仍含 **`min_usd`** 的旧数据走兼容解析。首装缺省会种子 **98 档**。
 
 **全局支持国家**（`GLOBAL#CONFIG` / `SHIPPING_COUNTRY_DEFAULTS`）：`GET/PUT /admin/config/shipping-countries`，body 示例：`{"countries":{"US":{"rate":"0.04","max_coverage_usd":9000},"CA":{"rate":"0.05","max_coverage_usd":8000}}}`。未出现在该对象中的国家 **不支持**，无需配置费率/保额。Worker 首次同步会 **种子** 一批常见国家；可整体替换。`shop/update` 与 **markets** webhook 仅对 **支持列表内的国家** 在 `sp_market_rates_json` 中自动写入 **全局配置里该国的默认 `rate`**（不在支持列表的国家不会写入店铺费率）。
 
@@ -272,7 +272,8 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
   - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
   - `GET /admin/shops/{shop}/audit`（审计流水）
-  - `PUT /admin/config/pricing-model`，body：`{"tiers":[...]}`（1–200 条；每条须含 `plan_code`、`min_usd`、`max_usd`、`price_usd`；可选 `sku` 作为 Shopify 库存 SKU）
+  - `GET /admin/config/pricing-model` → `{"tiers":[...]}`（与 `PUT` 体中 `tiers` 同形；无表内数据时返回代码内默认 98 档种子）
+  - `PUT /admin/config/pricing-model`，body：`{"tiers":[...]}`（1–200 条；每条 **`plan_code`** + **`price_usd`**；可选 **`sku`** 仅作 `plan_code` 别名；**`plan_code` 唯一**；不可删掉历史上已有的档位编码）
   - `GET /admin/config/shipping-countries`、`PUT /admin/config/shipping-countries`，body：`{"countries":{...}}`（每国 `rate` + `max_coverage_usd`；允许空对象表示暂不支持任何国家）
   - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、`sp_country_max_overrides`
 
@@ -325,3 +326,11 @@ npx aws-cdk@2 synth
 - `npx aws-cdk@2 deploy` — 将栈部署到默认 AWS 账号/区域  
 - `npx aws-cdk@2 diff` — 对比已部署栈与当前定义  
 - `npx aws-cdk@2 docs` — 打开 CDK 文档  
+
+
+
+## 部署
+、、、
+set -a && source .env.prod && set +a
+npx aws-cdk@2 deploy -c stage=prod  "GwofyGuardStorage-prod" "GwofyGuardApi-prod" --region ap-east-1
+、、、

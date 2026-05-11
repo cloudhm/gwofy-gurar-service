@@ -35,8 +35,8 @@ def run_activate_app(
     rate, fx_date = fetch_usd_to_currency(currency)
     tiers_shop: list[tuple[str, Decimal, str]] = []
     for t in tiers_cfg:
-        code = str(t.get("plan_code") or "")
-        sku = str(t.get("sku") or code)
+        code = str(t.get("plan_code") or t.get("sku") or "")
+        sku = code
         price_usd = Decimal(str(t.get("price_usd", 0)))
         price_shop = (price_usd * Decimal(str(rate))).quantize(Decimal("0.01"))
         tiers_shop.append((code, price_shop, sku))

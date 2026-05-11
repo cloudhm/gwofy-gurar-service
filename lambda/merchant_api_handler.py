@@ -365,33 +365,25 @@ def _resolve_variant(event, table, req_id: str):
     if country_opt:
         if not is_country_supported(table, country_opt):
             return _resp(400, {"error": "country_not_supported", "country": country_opt})
-        max_usd = float(effective_max_coverage_usd(table, item, country_opt))
-        if cart_usd > Decimal(str(max_usd)):
-            return _resp(
-                400,
-                {
-                    "error": "cart_exceeds_max_coverage",
-                    "max_coverage_usd": max_usd,
-                    "cart_subtotal_usd": str(cart_usd),
-                },
-            )
+        coverage_max = float(effective_max_coverage_usd(table, item, country_opt))
     else:
-        max_legacy = float(item.get("sp_max_coverage_usd") or 9000)
-        if cart_usd > Decimal(str(max_legacy)):
-            return _resp(
-                400,
-                {
-                    "error": "cart_exceeds_max_coverage",
-                    "max_coverage_usd": max_legacy,
-                    "cart_subtotal_usd": str(cart_usd),
-                },
-            )
+        coverage_max = float(item.get("sp_max_coverage_usd") or 9000)
 
-    tier = pick_tier(get_pricing_model(table), cart_usd)
+    if cart_usd > Decimal(str(coverage_max)):
+        return _resp(
+            400,
+            {
+                "error": "cart_exceeds_max_coverage",
+                "max_coverage_usd": coverage_max,
+                "cart_subtotal_usd": str(cart_usd),
+            },
+        )
+
+    tier = pick_tier(get_pricing_model(table), cart_usd, coverage_max_usd=coverage_max)
     if not tier:
         return _resp(404, {"error": "no_tier"})
 
-    plan_code = str(tier.get("plan_code") or "")
+    plan_code = str(tier.get("plan_code") or tier.get("sku") or "")
     enc = item.get("access_token_enc")
     if not enc:
         return _resp(500, {"error": "no_token"})

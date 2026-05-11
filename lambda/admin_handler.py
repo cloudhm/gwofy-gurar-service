@@ -17,7 +17,7 @@ from lib.admin_cognito import admin_in_required_group, cognito_groups_from_claim
 from lib.audit import append_audit
 from lib.logging_json import setup_logging
 from lib.models import GSI2_PK_SHOP_INDEX, SK_AUDIT_PREFIX, SK_METADATA, pk_shop, pk_tenant
-from lib.pricing_config import put_pricing_model
+from lib.pricing_config import get_pricing_model, put_pricing_model
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
 
 logger = setup_logging("admin")
@@ -65,6 +65,9 @@ def handler(event, context):
     actor_email = str(claims.get("email") or "")
 
     table = ddb.Table(os.environ["TABLE_NAME"])
+
+    if method == "GET" and path == "/admin/config/pricing-model":
+        return _resp(200, {"tiers": get_pricing_model(table)})
 
     if method == "PUT" and path == "/admin/config/pricing-model":
         return _put_pricing(event, table, actor_sub, actor_email, req_id)

@@ -97,7 +97,7 @@ def handler(event, context):
             out["refresh_token"] = refresh_token
         return _resp(200, "application/json", json.dumps(out))
 
-    return _resp(200, "text/html", _html_success(id_token, access_token))
+    return _resp(200, "text/html", _html_success(id_token, access_token, refresh_token))
 
 
 def _html_error(title: str, detail: str) -> str:
@@ -105,8 +105,19 @@ def _html_error(title: str, detail: str) -> str:
 <body><h1>{_esc(title)}</h1><pre>{_esc(detail)}</pre></body></html>"""
 
 
-def _html_success(id_token: str, access_token: str) -> str:
+def _html_success(id_token: str, access_token: str, refresh_token: str = "") -> str:
     # Id token is what API Gateway /admin expects in Authorization: Bearer
+    rt = (refresh_token or "").strip()
+    if rt:
+        refresh_section = f"""<h2>Refresh token</h2>
+<p style="color:#a60"><strong>Highly sensitive</strong> — longer-lived than the Id token; store securely and revoke in Cognito if leaked.</p>
+<textarea readonly rows="5" cols="100" style="width:100%;max-width:900px">{_esc(rt)}</textarea>
+<p>Use Cognito&apos;s token endpoint with <code>grant_type=refresh_token</code> to obtain new Id and Access tokens without logging in again.</p>
+"""
+    else:
+        refresh_section = """<p style="color:#666">No refresh token in this response. If you need one, ensure the app client allows refresh tokens and the authorize URL includes scopes such as <code>openid</code> and <code>offline_access</code>.</p>
+"""
+
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signed in</title></head>
 <body>
 <h1>Cognito login successful</h1>
@@ -115,6 +126,7 @@ def _html_success(id_token: str, access_token: str) -> str:
 <textarea readonly rows="8" cols="100" style="width:100%;max-width:900px">{_esc(id_token)}</textarea>
 <h2>Access token</h2>
 <textarea readonly rows="6" cols="100" style="width:100%;max-width:900px">{_esc(access_token)}</textarea>
+{refresh_section}
 <p style="color:#666">Treat tokens as secrets; do not share or log in production.</p>
 </body></html>"""
 

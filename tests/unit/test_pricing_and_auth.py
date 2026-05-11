@@ -5,7 +5,16 @@ from lib.pricing_resolve import pick_tier, shop_to_usd
 from lib.storefront_auth import storefront_hmac_sign, verify_shop_body_hmac
 
 
-def test_pick_tier_mid_range():
+def test_pick_tier_equal_split_mid_range():
+    tiers = [
+        {"plan_code": "S001", "price_usd": 1.0},
+        {"plan_code": "S002", "price_usd": 2.0},
+    ]
+    t = pick_tier(tiers, Decimal("50"), coverage_max_usd=200)
+    assert t and t["plan_code"] == "S001"
+
+
+def test_pick_tier_legacy_explicit_bands():
     tiers = [
         {"plan_code": "S001", "min_usd": 10.0, "max_usd": 100.0, "price_usd": 1.0},
         {"plan_code": "S002", "min_usd": 100.0, "max_usd": 200.0, "price_usd": 2.0},

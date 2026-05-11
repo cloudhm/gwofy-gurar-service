@@ -46,7 +46,7 @@ def build_cart_plugin_response(
 
     tiers = get_pricing_model(table)
     first = tiers[0] if tiers else {}
-    sp_sku = str(first.get("sku") or first.get("plan_code") or "S0001")
+    sp_sku = str(first.get("plan_code") or first.get("sku") or "S0001")
     sn = str(meta.get("store_number") or "")
     pub = str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat())
 

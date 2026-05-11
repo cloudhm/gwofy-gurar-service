@@ -116,24 +116,15 @@ assert len(DEFAULT_VARIANT_USD_PRICES) == 98
 
 
 def build_default_tiers(
-    coverage_max_usd: float = DEFAULT_COVERAGE_MAX_USD,
+    _coverage_max_usd: float = DEFAULT_COVERAGE_MAX_USD,
 ) -> list[dict[str, Any]]:
-    """Half-open bands [min_usd, max_usd) on cart subtotal USD; last tier unbounded above."""
-    n = len(DEFAULT_VARIANT_USD_PRICES)
+    """Cart USD bands are derived at resolve time from tier order and effective coverage max (see pricing_resolve)."""
     tiers: list[dict[str, Any]] = []
     for i, price_s in enumerate(DEFAULT_VARIANT_USD_PRICES):
         plan = f"S{i + 1:04d}"
-        lo = coverage_max_usd * i / n
-        if i < n - 1:
-            hi = coverage_max_usd * (i + 1) / n
-        else:
-            hi = 10**18
         tiers.append(
             {
                 "plan_code": plan,
-                "sku": plan,
-                "min_usd": round(lo, 6),
-                "max_usd": round(hi, 6) if i < n - 1 else hi,
                 "price_usd": float(price_s),
             }
         )
