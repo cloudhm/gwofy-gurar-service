@@ -81,6 +81,8 @@ GitHub → **Settings → Secrets and variables → Actions → New repository s
 | 或使用长期密钥（不推荐久留）：`AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` | 与 IAM 用户对应 |
 | `SHOPIFY_CLIENT_ID` | Partner 应用 Client ID |
 | `SHOPIFY_CLIENT_SECRET` | Partner 应用 Secret |
+| `ADMIN_COGNITO_USER_POOL_ID` | 已有 Cognito User Pool ID（与 Api 栈 JWT 一致） |
+| `ADMIN_COGNITO_CLIENT_ID` | **可选**。省略时部署会在该 Pool 内 **创建或复用** 名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client，并将其 ID 作为 JWT `aud`（见栈输出 `AdminCognitoUserPoolClientId`）。若你方已建好 Client，可填此项以跳过 Custom Resource。 |
 | `GWOFY_API_CERTIFICATE_ARN` | `ap-east-1` 的 ACM 证书 ARN |
 
 区域可通过 workflow 里写死 `ap-east-1`，或再加 Secret `AWS_REGION`。
@@ -111,6 +113,9 @@ jobs:
         env:
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
           SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          ADMIN_COGNITO_USER_POOL_ID: ${{ secrets.ADMIN_COGNITO_USER_POOL_ID }}
+          # 可选：省略则由 Custom Resource 确保 Pool 内存在 GWO-SHIPPING-PROTECTION App Client
+          ADMIN_COGNITO_CLIENT_ID: ${{ secrets.ADMIN_COGNITO_CLIENT_ID }}
           GWOFY_API_CERTIFICATE_ARN: ${{ secrets.GWOFY_API_CERTIFICATE_ARN }}
 ```
 
@@ -127,16 +132,19 @@ jobs:
 ## 部署
 
 1. 安装依赖：`pip install -r requirements.txt`（开发依赖：`pip install -r requirements-dev.txt`）。
-2. 设置 Shopify 凭证供合成/部署使用（CDK 会将其写入 Lambda 环境变量）：
+2. 设置 Shopify 凭证供合成/部署使用（CDK 会将其写入 Lambda 环境变量），并配置 **已有 Cognito**（管理端 `/admin` JWT；本栈 **不再创建** User Pool）：
 
    ```bash
    export SHOPIFY_CLIENT_ID=...
    export SHOPIFY_CLIENT_SECRET=...
+   export ADMIN_COGNITO_USER_POOL_ID=...   # 例 us-east-1_xxxx
+   # 可选：export ADMIN_COGNITO_CLIENT_ID=...  # 已有 App Client；不设则自动确保名为 GWO-SHIPPING-PROTECTION 的 Client
+   # 若 Pool 不在 Api 栈部署区域，再设：export ADMIN_COGNITO_REGION=ap-east-1
    ```
 
    可选：`WEBHOOK_BASE_URL`（与 API Gateway 根 URL 同源，例如 `https://xxxx.execute-api.region.amazonaws.com`）、`POST_INSTALL_REDIRECT_URL`、`FEISHU_WEBHOOK_URL`。
 
-   也可使用 CDK context：`-c shopify_client_id=... -c shopify_client_secret=... -c webhook_base_url=...`
+   也可使用 CDK context：`-c shopify_client_id=... -c shopify_client_secret=... -c webhook_base_url=...`，以及 **`-c admin_cognito_user_pool_id=...`**（可选 `-c admin_cognito_client_id=...`、`-c admin_cognito_region=...`）。
 
 3. 合成 / 部署（默认 `stage=dev`，栈名为 `GwofyGuardStorage-dev` / `GwofyGuardApi-dev`）：
 
@@ -150,6 +158,8 @@ jobs:
    ```bash
    export SHOPIFY_CLIENT_ID=...   # 可与 dev 不同（若在 Partner 创建了单独的 Custom app）
    export SHOPIFY_CLIENT_SECRET=...
+   export ADMIN_COGNITO_USER_POOL_ID=...
+   # export ADMIN_COGNITO_CLIENT_ID=...  # 可选，见上文
    export WEBHOOK_BASE_URL=https://xxxx.execute-api....amazonaws.com   # 部署后填写 Api 栈对应的 URL
 
    # 开发联调
@@ -204,7 +214,14 @@ jobs:
 
    或使用 context：`-c certificate_arn=...`
 
-3. **DNS**：部署完成后，在栈 **Outputs** 中查看 **CustomDomainRegionalTarget**（及 **CustomDomainRegionalHostedZoneId**，若使用 Route 53 别名）。将 `sp-dev.gwofy.com` 等 **CNAME** 指到该目标（具体以控制台说明为准）。
+3. **DNS（二选一）**  
+   - **自动（Route 53 托管 `gwofy.com`）**：部署 Api 栈前同时设置 **`GWOFY_ROUTE53_HOSTED_ZONE_ID`**（Hosted zone ID）与 **`GWOFY_ROUTE53_ZONE_NAME`**（例如 `gwofy.com`，须与自定义域名后缀一致）。CDK 会在该公有区创建 **`sp-{stage}.gwofy.com` → API Gateway** 的别名 **A** 记录（IPv4）。等价 context：`-c route53_hosted_zone_id=... -c route53_zone_name=gwofy.com`。  
+     - 若同名记录已在 Route 53 里手工创建且 **不在本 CloudFormation 栈管理**，再次部署可能冲突；请先删除手工记录或改用栈接管。  
+     - CDK **不会**在未提供上述两项时访问 Route 53；未设置时仍需手工 DNS。  
+   - **手工**：在栈 **Outputs** 查看 **CustomDomainRegionalTarget**，将 `sp-dev.gwofy.com` 等对 API Gateway 区域域名做 **CNAME**（或以别名记录指向输出目标）。
+
+   API Gateway 控制台中的 API **名称**为 **`gwofy-guard-api-{stage}`**（例如 dev / prod），便于区分环境。
+
 4. **Webhook / OAuth 根地址**：只要提供了证书 ARN，CDK 会将 Lambda 的 `WEBHOOK_BASE_URL` **默认设为 `https://sp-{stage}.gwofy.com`**（除非你显式设置了 `WEBHOOK_BASE_URL`）。Partner Dashboard 与 `shopify.app.toml` 应使用栈输出 **PublicApiUrl**（或同一 HTTPS 根地址），路径仍为 `/oauth/callback`、`/webhooks/shopify`。
 5. **可选覆盖**：完整主机名可用环境变量 `GWOFY_CUSTOM_DOMAIN` 或 `-c custom_domain_name=`（一般无需修改）。
 6. **命名约定**：根域名与前缀可通过 `GWOFY_DOMAIN_BASE` / `GWOFY_SUBDOMAIN_PREFIX` 或 context `gwofy_domain_base`、`gwofy_subdomain_prefix` 调整（默认 `gwofy.com` + `sp`）。
@@ -216,6 +233,50 @@ jobs:
 python3 scripts/check_gwofy_deploy.py --stage dev
 # 或指定主机：python3 scripts/check_gwofy_deploy.py --host sp-dev.gwofy.com
 ```
+
+## 商户 API、激活与管理员（Cognito）
+
+部署 **Api** 栈后，除原有 OAuth / Webhook 外，还提供：
+
+### 商户端（Shopify Session Token JWT）
+
+路径均位于 `{HttpApiUrl}` 根下，请求头 `Authorization: Bearer <session_token>`（与 [Session token](https://shopify.dev/docs/apps/auth/session-tokens) 一致）。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link` 等 |
+| POST | `/api/activate` | 入队异步激活（Worker 创建/更新 Shipping Protection 商品、写回 `protection_product_gid`） |
+| PATCH | `/api/me/embed` | JSON body：`{"embed_enabled_ack": true}` |
+| POST | `/api/protection/resolve-variant` | **无 Session JWT**。同上 HMAC。Body 须含 `cart_subtotal`、`currency`（须与店铺结算货币一致）。**须已完成激活**（`activation_status=ACTIVATED`）。可选 `country`：若传入则须为全局支持国家，且会用该国 **有效最大保额（USD）** 校验购物车折算 USD 是否超限；不传 `country` 时仅用店铺级 `sp_max_coverage_usd`（或默认 9000）做上限校验。 |
+| POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`。可选 `cart_subtotal` + `currency`（须与店铺货币一致）：超过该国 **有效最大保额（USD）** → **400** `cart_exceeds_max_coverage`。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。 |
+
+可选环境变量（CDK 写入 Worker / 商户 Lambda，也可用 `-c` context）：`ORDER_PROTECTION_TAG`（默认 `gwofy-shipping-protection`）— 仅用于在 **本系统 DynamoDB 订单镜像** 上写入 `sync_tags`（**不会**调用 Shopify 修改商户订单）。
+
+激活时 Worker 会在商户店创建 **UNLISTED** 运费险商品，**handle** 固定为 **`GWOFY-SHIPPING-PROTECTION-QAQWER`**，变体 **Plan = S0001…S0098**，每变体 **独立 SKU**（默认与 `plan_code` 相同）。档位与 **USD 加价**、**购物车保额区间**（默认按 0–9000 USD 均分 98 档）由全局 **`PUT /admin/config/pricing-model`** 的 `tiers` 定义（字段 `plan_code`、`min_usd`、`max_usd`、`price_usd`，可选 `sku` 覆盖库存 SKU）。首装缺省会种子 **98 档** 与你们提供的默认价表一致。
+
+**全局支持国家**（`GLOBAL#CONFIG` / `SHIPPING_COUNTRY_DEFAULTS`）：`GET/PUT /admin/config/shipping-countries`，body 示例：`{"countries":{"US":{"rate":"0.04","max_coverage_usd":9000},"CA":{"rate":"0.05","max_coverage_usd":8000}}}`。未出现在该对象中的国家 **不支持**，无需配置费率/保额。Worker 首次同步会 **种子** 一批常见国家；可整体替换。`shop/update` 与 **markets** webhook 仅对 **支持列表内的国家** 在 `sp_market_rates_json` 中自动写入 **全局配置里该国的默认 `rate`**（不在支持列表的国家不会写入店铺费率）。
+
+**店铺覆盖**：`PUT /admin/shops/{shop}/shipping-calc-settings` 可更新 `sp_market_rates`（某国 **特殊费率**，覆盖全局默认）、`sp_max_coverage_usd`（全店兜底保额）、`sp_country_max_overrides`（按国覆盖最大保额，如 `{"US":12000}`）。**有效费率** = 店铺该国费率（若有）否则全局该国 `rate`；**有效最大保额（USD）** = 店铺 `sp_country_max_overrides` 该国值 → 否则全局该国 `max_coverage_usd` → 否则 `sp_max_coverage_usd` → 否则 9000。Partner 需 **`read_markets`**（见 `shopify.app.toml`）。
+
+### 管理员（Cognito JWT + 用户组）
+
+- **User Pool / App Client**：使用你们 **已存在的** Cognito User Pool。部署前必须设置 **`ADMIN_COGNITO_USER_POOL_ID`**（或 context `admin_cognito_user_pool_id`）。**`ADMIN_COGNITO_CLIENT_ID`**（或 `admin_cognito_client_id`）为 **可选**：若省略，Api 栈会通过 **Custom Resource** 在 Pool 内 **列出** 已有 clients，若无名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client 则 **创建**（`GenerateSecret=false`，常见浏览器登录流），并把得到的 **ClientId** 写入 JWT Authorizer 的 `aud` 与输出 `AdminCognitoUserPoolClientId`。若 Pool 不在 Api 栈所在 AWS 区域，再设 **`ADMIN_COGNITO_REGION`**（或 `admin_cognito_region`）。**仅缺少 User Pool ID 时** `cdk synth` / `deploy` 会报错。删除 CloudFormation 栈时 **不会** 删除该自动创建的 App Client（Delete 请求中不调用 Cognito 删除）。
+- 栈 **Outputs**：`AdminCognitoUserPoolId`、`AdminCognitoUserPoolClientId`、`AdminCognitoIssuer`、`AdminCognitoRegion`。用户与密码由 **你们既有身份平台** 管理。
+- 调用 `/admin/...` 时请求头使用 **`Authorization: Bearer <Cognito Id Token>`**（须含 `cognito:groups` 声明）。除 API Gateway 对 JWT 的签名校验外，Lambda 会要求调用者属于你们 **已存在的** 用户组 **`GWOFY-SHIPPING-PROTECTION`**（本栈 **不会** 创建该组；请在你们身份平台侧维护成员）。未入组返回 **403** `forbidden_not_in_admin_group`。
+- 可通过环境变量或 CDK context **`admin_cognito_group`** / `ADMIN_COGNITO_GROUP` 覆盖默认组名（一般保持 `GWOFY-SHIPPING-PROTECTION` 即可）。
+- **Cognito Hosted UI 回调**：`GET /auth/callback`（**无需** JWT）。浏览器从 Cognito **`/oauth2/authorize`** 授权后带 `?code=` 重定向至此；Lambda 向 Cognito **`/oauth2/token`** 换 token，默认返回 **HTML**（可复制 **Id token** 用于 `Authorization: Bearer`）；请求头 **`Accept: application/json`** 时返回 JSON。**回调 URL** 由 **`WEBHOOK_BASE_URL` + `/auth/callback`** 组成（须与 Cognito App Client 里配置的 Allowed callback URLs **完全一致**）。部署前还需设置 **`COGNITO_HOSTED_UI_DOMAIN`**（或 `-c cognito_hosted_ui_domain=`），值为 Cognito **域名前缀主机名**，例如 **`ap-east-1xxxx.auth.ap-east-1.amazoncognito.com`**（不要带 `https://`）。
+- 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience = `AdminCognitoUserPoolClientId`）：
+  - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）
+  - `GET /admin/shops/{shop}`（`shop` 需 URL 编码）
+  - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
+  - `POST /admin/shops/{shop}/suspend`、`.../resume`
+  - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
+  - `GET /admin/shops/{shop}/audit`（审计流水）
+  - `PUT /admin/config/pricing-model`，body：`{"tiers":[...]}`（1–200 条；每条须含 `plan_code`、`min_usd`、`max_usd`、`price_usd`；可选 `sku` 作为 Shopify 库存 SKU）
+  - `GET /admin/config/shipping-countries`、`PUT /admin/config/shipping-countries`，body：`{"countries":{...}}`（每国 `rate` + `max_coverage_usd`；允许空对象表示暂不支持任何国家）
+  - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、`sp_country_max_overrides`
+
+定价 / 变体模板 / 支持国家缺省时 Worker 会种子写入 `GLOBAL#CONFIG` 下 `PRICING_MODEL_DEFAULT`（默认 98 档）与 `SHIPPING_COUNTRY_DEFAULTS`。DynamoDB 表含 **GSI2**（`SHOP_INDEX`）用于列举店铺。
 
 ---
 

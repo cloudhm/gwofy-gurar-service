@@ -9,13 +9,20 @@ from typing import Any
 
 import boto3
 
+from lib.activate_app import run_activate_app_safe
 from lib.customer_order_sync import sync_customers, sync_orders
 from lib.feishu import send_text
 from lib.kms_tokens import decrypt_token
 from lib.logging_json import setup_logging
-from lib.models import SK_METADATA, pk_shop, pk_tenant, pk_webhook
+from lib.models import SK_METADATA, pk_shop, pk_tenant
+from lib.shop_archive import archive_and_delete_shop
+from lib.pricing_config import ensure_default_pricing_seed
+from lib.shipping_country_defaults import ensure_shipping_country_defaults_seed
 from lib.product_sync import sync_products_initial
+from lib.shop_profile_sync import sync_shop_profile
 from lib.shopify_api import DEFAULT_API_VERSION, graphql_request
+from lib.order_protection import order_has_protection_product
+from lib.sync_order_tags import order_sync_tags
 
 logger = setup_logging("worker")
 
@@ -55,6 +62,29 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
             )
         return
 
+    if src == "merchant_api":
+        ev = body.get("event")
+        shop = body["shop"]
+        store_number = str(body.get("store_number", ""))
+        meta = _shop_row(table, shop)
+        if not meta or meta.get("installation_status") != "ACTIVE":
+            logger.info("skip_merchant_job_inactive", extra={"shop": shop, "event": ev})
+            return
+        enc = meta.get("access_token_enc")
+        if not enc:
+            return
+        key_id = meta.get("kms_key_id") or kms_key_id
+        token = decrypt_token(key_id, enc)
+        ver = body.get("api_version") or api_version
+        if ev == "SHOP_PROFILE_SYNC":
+            sync_shop_profile(table, shop, token, ver)
+            return
+        if ev == "ACTIVATE_APP":
+            run_activate_app_safe(table, shop, store_number, token, kms_key_id, ver)
+            return
+        logger.warning("unknown_merchant_event", extra={"event": ev})
+        return
+
     if src == "reconcile":
         shop = body["shop"]
         store_number = body["store_number"]
@@ -84,9 +114,16 @@ def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
         return
     key_id = meta.get("kms_key_id") or kms_key_id
     token = decrypt_token(key_id, enc)
+    ensure_default_pricing_seed(os.environ["TABLE_NAME"])
+    ensure_shipping_country_defaults_seed(os.environ["TABLE_NAME"])
+    sync_shop_profile(table, shop, token, api_version)
+    meta = _shop_row(table, shop) or {}
+    protection_gid = meta.get("protection_product_gid")
     sync_products_initial(table, shop, store_number, token, api_version)
     sync_customers(table, shop, store_number, token, api_version)
-    sync_orders(table, shop, store_number, token, api_version)
+    sync_orders(
+        table, shop, store_number, token, api_version, protection_product_gid=protection_gid
+    )
 
 
 def _advance_reconcile_marker(table, shop: str, resource: str) -> None:
@@ -130,6 +167,13 @@ def process_webhook_envelope(
     key_id = meta.get("kms_key_id") or kms_key_id
     token = decrypt_token(key_id, enc)
 
+    if t in ("shop/update", "markets/create", "markets/update"):
+        try:
+            sync_shop_profile(table, shop, token, api_version)
+        except Exception:
+            logger.exception("shop_profile_webhook_failed", extra={"shop": shop, "topic": t})
+        return
+
     if t in ("products/update", "products/create"):
         handle_product_webhook(table, shop, store_number, token, envelope.get("body") or "", api_version)
     elif t in ("orders/create", "orders/updated"):
@@ -139,13 +183,14 @@ def process_webhook_envelope(
 
 
 def handle_uninstall(table, shop: str, feishu_url: str, webhook_id: str) -> None:
-    pk = pk_shop(shop)
     now = datetime.now(timezone.utc).isoformat()
-    table.update_item(
-        Key={"pk": pk, "sk": SK_METADATA},
-        UpdateExpression="SET installation_status = :u, uninstalled_at = :t, updated_at = :t REMOVE access_token_enc",
-        ExpressionAttributeValues={":u": "UNINSTALLED", ":t": now},
-    )
+    archived_name = os.environ.get("ARCHIVED_TABLE_NAME", "").strip()
+    if archived_name:
+        archive_table = ddb.Table(archived_name)
+        n = archive_and_delete_shop(table, archive_table, shop)
+        logger.info("shop_archived_on_uninstall", extra={"shop": shop, "rows": n})
+    else:
+        logger.error("missing_archived_table_name", extra={"shop": shop})
     send_text(
         feishu_url,
         f"[Gwofy] App uninstalled\nshop={shop}\nwebhook_id={webhook_id}\ntime={now}",
@@ -272,6 +317,14 @@ query OrderOne($id: ID!) {
     name
     processedAt
     createdAt
+    lineItems(first: 50) {
+      edges {
+        node {
+          quantity
+          product { id }
+        }
+      }
+    }
   }
 }
 """
@@ -291,6 +344,9 @@ def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, r
     node = data.get("data", {}).get("order")
     if not node:
         return
+    meta = _shop_row(table, shop) or {}
+    protection_gid = meta.get("protection_product_gid")
+    has_prot = order_has_protection_product(node, protection_gid)
     pk_t = pk_tenant(store_number)
     gid = node["id"]
     now = datetime.now(timezone.utc).isoformat()
@@ -302,6 +358,8 @@ def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, r
             "updated_at_source": node.get("updatedAt"),
             "synced_at": now,
             "shopify_id": gid,
+            "has_shipping_protection": has_prot,
+            "sync_tags": order_sync_tags(has_prot, protection_gid),
         }
     )
 

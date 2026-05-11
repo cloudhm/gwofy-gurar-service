@@ -80,6 +80,7 @@ def main() -> int:
     # API Gateway 根路径常为 404，仍表示 TLS 与路由可达
     print(f"  HTTPS: OK (HTTP {code})")
     print(f"  OAuth callback: {base}/oauth/callback")
+    print(f"  Cognito admin callback: {base}/auth/callback")
     print(f"  Shopify webhook: {base}/webhooks/shopify")
     return 0
 

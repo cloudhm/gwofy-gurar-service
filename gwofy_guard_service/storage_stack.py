@@ -17,7 +17,7 @@ from constructs import Construct
 
 
 class StorageStack(Stack):
-    """Core data plane: single-table DynamoDB, KMS for tokens, work queue."""
+    """Core data plane: online + archived DynamoDB tables, KMS for tokens, work queue."""
 
     def __init__(self, scope: Construct, construct_id: str, *, stage: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -52,11 +52,36 @@ class StorageStack(Stack):
             removal_policy=RemovalPolicy.RETAIN if retain else RemovalPolicy.DESTROY,
         )
 
+        archived_physical_name = f"{physical_table_name}-archived"
+        if len(archived_physical_name) > 255:
+            archived_physical_name = archived_physical_name[:255]
+
+        self.archived_table = dynamodb.Table(
+            self,
+            "ArchivedAppTable",
+            table_name=archived_physical_name,
+            partition_key=dynamodb.Attribute(name="pk", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="sk", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True,
+            ),
+            removal_policy=RemovalPolicy.RETAIN if retain else RemovalPolicy.DESTROY,
+        )
+
         # GSI: variant price history point-in-time (optional queries)
         self.table.add_global_secondary_index(
             index_name="GSI1",
             partition_key=dynamodb.Attribute(name="gsi1pk", type=dynamodb.AttributeType.STRING),
             sort_key=dynamodb.Attribute(name="gsi1sk", type=dynamodb.AttributeType.STRING),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+
+        # GSI2: list installed shops for admin (pk=SHOP_INDEX on METADATA rows)
+        self.table.add_global_secondary_index(
+            index_name="GSI2",
+            partition_key=dynamodb.Attribute(name="gsi2pk", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="gsi2sk", type=dynamodb.AttributeType.STRING),
             projection_type=dynamodb.ProjectionType.ALL,
         )
 

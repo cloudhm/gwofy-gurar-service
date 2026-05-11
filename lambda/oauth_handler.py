@@ -11,7 +11,7 @@ import boto3
 
 from lib.kms_tokens import encrypt_token
 from lib.logging_json import setup_logging
-from lib.models import SK_METADATA, pk_shop
+from lib.models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
 from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, register_webhook_rest, verify_oauth_hmac
 from lib.store_number import allocate_store_number
 
@@ -58,22 +58,41 @@ def handler(event, context):
     table = ddb.Table(table_name)
     pk = pk_shop(shop)
     now = datetime.now(timezone.utc).isoformat()
+    prev = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item") or {}
+    installed_at = str(prev.get("installed_at") or now)
 
-    table.put_item(
-        Item={
-            "pk": pk,
-            "sk": SK_METADATA,
-            "shop": shop,
-            "store_number": store_number,
-            "access_token_enc": enc,
-            "scopes": scopes,
-            "installation_status": "ACTIVE",
-            "installed_at": now,
-            "updated_at": now,
-            "kms_key_id": kms_key_id,
-            "oauth_state_last": state,
-        }
-    )
+    item = {
+        "pk": pk,
+        "sk": SK_METADATA,
+        "shop": shop,
+        "store_number": store_number,
+        "access_token_enc": enc,
+        "scopes": scopes,
+        "installation_status": "ACTIVE",
+        "installed_at": installed_at,
+        "updated_at": now,
+        "kms_key_id": kms_key_id,
+        "oauth_state_last": state,
+        "activation_status": "UNACTIVATED",
+        "return_insurance_status": "CLOSED",
+        "shipping_protection_status": "CLOSED",
+        "plugin_suspended": False,
+        "embed_enabled_ack": False,
+        "gsi2pk": GSI2_PK_SHOP_INDEX,
+        "gsi2sk": f"{installed_at}#{shop}",
+    }
+    for k in (
+        "activation_status",
+        "protection_product_gid",
+        "embed_enabled_ack",
+        "return_insurance_status",
+        "shipping_protection_status",
+        "plugin_suspended",
+    ):
+        if prev.get(k) is not None:
+            item[k] = prev[k]
+
+    table.put_item(Item=item)
 
     webhook_base = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
     if webhook_base:
@@ -89,6 +108,9 @@ def handler(event, context):
             "customers/data_request",
             "customers/redact",
             "shop/redact",
+            "shop/update",
+            "markets/create",
+            "markets/update",
         ]
         for topic in topics:
             try:
