@@ -11,7 +11,7 @@ import boto3
 from lib.kms_tokens import encrypt_token
 from lib.logging_json import setup_logging
 from lib.models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
-from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, register_webhook_rest, verify_oauth_hmac
+from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, verify_oauth_hmac
 from lib.store_number import allocate_store_number
 
 logger = setup_logging("oauth")
@@ -19,25 +19,13 @@ logger = setup_logging("oauth")
 ddb = boto3.resource("dynamodb")
 sqs = boto3.client("sqs")
 
-# Partner Dashboard app URL handle (path segment after /apps/).
-_SHOPIFY_ADMIN_APP_HANDLE = "gwofy-guard"
 
-
-def _shop_admin_slug(shop: str) -> str:
-    """`storename.myshopify.com` -> `storename` for admin.shopify.com/store/... URLs."""
-    s = shop.strip().lower().rstrip("/")
-    suffix = ".myshopify.com"
-    if s.endswith(suffix):
-        return s[: -len(suffix)]
-    return s
-
-
-def _post_install_redirect_location(shop: str) -> str:
+def _post_install_redirect_location(shop: str, app_client_id: str) -> str:
     custom = (os.environ.get("POST_INSTALL_REDIRECT_URL") or "").strip()
     if custom:
         return custom
-    slug = _shop_admin_slug(shop)
-    return f"https://admin.shopify.com/store/{slug}/apps/{_SHOPIFY_ADMIN_APP_HANDLE}"
+    host = shop.strip().lower().rstrip("/")
+    return f"https://{host}/admin/apps/{app_client_id}"
 
 
 def handler(event, context):
@@ -115,30 +103,9 @@ def handler(event, context):
 
     table.put_item(Item=item)
 
-    webhook_base = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
-    if webhook_base:
-        hook_url = f"{webhook_base}/webhooks/shopify"
-        topics = [
-            "app/uninstalled",
-            "products/create",
-            "products/update",
-            "orders/create",
-            "orders/updated",
-            "customers/data_request",
-            "customers/redact",
-            "shop/redact",
-            "shop/update",
-            "markets/create",
-            "markets/update",
-        ]
-        for topic in topics:
-            try:
-                register_webhook_rest(shop, access_token, topic, hook_url, api_version=api_version)
-            except Exception as e:
-                logger.warning(
-                    "webhook_register_failed",
-                    extra={"topic": topic, "shop": shop, "error": str(e)[:200]},
-                )
+    # Webhook topics are declared in shopify.app.toml (app config). Do not register
+    # the same topics again via Admin REST here — that duplicates subscriptions when
+    # both TOML and OAuth run, causing multiple deliveries per Shopify event.
 
     internal = {
         "source": "oauth",
@@ -155,7 +122,7 @@ def handler(event, context):
         MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),
     )
 
-    location = _post_install_redirect_location(shop)
+    location = _post_install_redirect_location(shop, client_id)
     return {"statusCode": 302, "headers": {"Location": location}, "body": ""}
 
 

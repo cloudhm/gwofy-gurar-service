@@ -16,6 +16,7 @@ redirect_urls = [
 ]
 
 [webhooks]
+# Single source of truth for topics — OAuth does not REST-register (avoids duplicate subscriptions).
 api_version = "2024-10"
 
 [[webhooks.subscriptions]]

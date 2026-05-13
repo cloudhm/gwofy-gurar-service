@@ -190,6 +190,8 @@ jobs:
 
 4. 复制栈输出中的 **HttpApiUrl**，在 Partner Dashboard / `shopify.app.toml` 中将重定向 URI 设为 `{HttpApiUrl}/oauth/callback`，Webhook URL 设为 `{HttpApiUrl}/webhooks/shopify`。
 
+   **Webhook 订阅**：topic 列表以仓库根目录 `shopify.app.toml` 的 `[webhooks]` 为准（随应用配置同步到 Shopify）。OAuth 回调 **不再** 调用 Admin REST 注册 webhooks，避免与 App 配置 **重复订阅**、同一事件多次投递。
+
    **Shopify 侧**：同一应用可在 Partner Dashboard 配置 **多个 redirect URL**（dev/staging/prod 各一条）；Webhook 地址亦可按环境各配一条。也可为 dev/prod 分别创建 Custom app，隔离 `client_id`。
 
 5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。

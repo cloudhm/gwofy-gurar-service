@@ -44,4 +44,7 @@ def pk_webhook(webhook_id: str) -> str:
     return f"WEBHOOK#{webhook_id}"
 
 
+# One row per processed HTTPS webhook delivery (X-Shopify-Webhook-Id).
+SK_WEBHOOK_PROCESSED = "PROCESSED"
+
 SK_METADATA = "METADATA"

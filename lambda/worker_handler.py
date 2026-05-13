@@ -13,7 +13,7 @@ from lib.customer_order_sync import sync_orders
 from lib.feishu import send_text
 from lib.kms_tokens import decrypt_token
 from lib.logging_json import setup_logging
-from lib.models import SK_METADATA, pk_shop, pk_tenant
+from lib.models import SK_METADATA, SK_WEBHOOK_PROCESSED, pk_shop, pk_tenant, pk_webhook
 from lib.shop_archive import archive_and_delete_shop
 from lib.activity_config import ensure_activity_info_seed
 from lib.calc_coverage_tips_config import ensure_calc_coverage_tips_seed
@@ -137,6 +137,28 @@ def _advance_reconcile_marker(table, shop: str, resource: str) -> None:
     table.put_item(Item={"pk": pk, "sk": sk, "last_reconciled_at": now})
 
 
+def _webhook_delivery_already_processed(table, webhook_id: str) -> bool:
+    if not webhook_id:
+        return False
+    key = {"pk": pk_webhook(webhook_id), "sk": SK_WEBHOOK_PROCESSED}
+    return bool(table.get_item(Key=key).get("Item"))
+
+
+def _mark_webhook_delivery_processed(
+    table, webhook_id: str, topic: str, shop: str
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    table.put_item(
+        Item={
+            "pk": pk_webhook(webhook_id),
+            "sk": SK_WEBHOOK_PROCESSED,
+            "processed_at": now,
+            "topic": topic,
+            "shop": shop,
+        }
+    )
+
+
 def process_webhook_envelope(
     table,
     envelope: dict[str, Any],
@@ -146,7 +168,32 @@ def process_webhook_envelope(
 ) -> None:
     headers = {k.lower(): v for k, v in (envelope.get("headers") or {}).items()}
     topic = headers.get("x-shopify-topic") or ""
-    webhook_id = headers.get("x-shopify-webhook-id") or ""
+    webhook_id = (headers.get("x-shopify-webhook-id") or "").strip()
+    shop = (headers.get("x-shopify-shop-domain") or "").strip()
+
+    if webhook_id and _webhook_delivery_already_processed(table, webhook_id):
+        logger.info(
+            "webhook_duplicate_skip",
+            extra={"webhook_id": webhook_id, "topic": topic, "shop": shop},
+        )
+        return
+
+    _execute_webhook_envelope(table, envelope, headers, kms_key_id, api_version, feishu_url)
+
+    if webhook_id:
+        _mark_webhook_delivery_processed(table, webhook_id, topic, shop)
+
+
+def _execute_webhook_envelope(
+    table,
+    envelope: dict[str, Any],
+    headers: dict[str, Any],
+    kms_key_id: str,
+    api_version: str,
+    feishu_url: str,
+) -> None:
+    topic = headers.get("x-shopify-topic") or ""
+    webhook_id = (headers.get("x-shopify-webhook-id") or "").strip()
     shop = (headers.get("x-shopify-shop-domain") or "").strip()
     t = (topic or "").lower().strip()
 

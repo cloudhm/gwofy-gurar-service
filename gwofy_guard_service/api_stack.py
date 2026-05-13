@@ -345,6 +345,7 @@ class ApiStack(Stack):
         work_queue.grant_send_messages(oauth_fn)
         work_queue.grant_send_messages(reconcile_fn)
         work_queue.grant_send_messages(merchant_fn)
+        work_queue.grant_send_messages(webhook_fn)
         work_queue.grant_consume_messages(worker_fn)
 
         worker_fn.add_event_source(
