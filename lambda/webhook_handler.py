@@ -121,7 +121,7 @@ def handler(event, context):
     }
 
     try:
-        sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(envelope))
+        send_resp = sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(envelope))
     except Exception:
         logger.exception(
             "sqs_send_failed",
@@ -140,6 +140,7 @@ def handler(event, context):
             "shop": out_headers.get("x-shopify-shop-domain"),
             "webhook_id": out_headers.get("x-shopify-webhook-id"),
             "payload_len": len(raw_body),
+            "sqs_message_id": send_resp.get("MessageId"),
         },
     )
     return {"statusCode": 200, "body": json.dumps({"ok": True})}

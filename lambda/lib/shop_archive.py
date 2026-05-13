@@ -27,6 +27,9 @@ def query_all_items(table, pk: str) -> list[dict[str, Any]]:
 def sanitize_item_for_archive(item: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(item)
     out.pop("access_token_enc", None)
+    out.pop("refresh_token_enc", None)
+    out.pop("shopify_offline_access_token_expires_at", None)
+    out.pop("shopify_offline_refresh_token_expires_at", None)
     return out
 
 

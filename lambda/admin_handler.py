@@ -50,6 +50,8 @@ from lib.merchant_premium_rules import parse_rules_from_meta
 from lib.kms_tokens import decrypt_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
+from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.shopify_api import DEFAULT_API_VERSION
 
 logger = setup_logging("admin")
 
@@ -151,6 +153,9 @@ def handler(event, context):
     if method == "PUT" and path == "/admin/config/calc-coverage-tips":
         return _put_calc_coverage_tips_global(event, table, actor_sub, actor_email, req_id)
 
+    if method == "POST" and path == "/admin/tools/decrypt-shopify-token":
+        return _post_admin_decrypt_shopify_token(event, table, actor_sub, actor_email, req_id)
+
     if method == "GET" and path == "/admin/shops":
         return _list_shops(event, table, actor_sub, req_id)
 
@@ -194,6 +199,89 @@ def handler(event, context):
         return _suspend(table, shop, False, actor_sub, actor_email, req_id)
 
     return _resp(404, {"error": "not_found"})
+
+
+_MAX_ACCESS_TOKEN_ENC_B64 = 24_000
+
+
+def _post_admin_decrypt_shopify_token(
+    event, table, actor_sub: str, actor_email: str, req_id: str
+):
+    """Decrypt Dynamo `access_token_enc` (KMS + same context as oauth). Admin-only; audit without plaintext."""
+    try:
+        raw = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    if not isinstance(raw, dict):
+        return _resp(400, {"error": "invalid_body"})
+    enc = raw.get("access_token_enc")
+    if not isinstance(enc, str) or not enc.strip():
+        return _resp(400, {"error": "access_token_enc_required"})
+    enc = enc.strip()
+    if len(enc) > _MAX_ACCESS_TOKEN_ENC_B64:
+        return _resp(400, {"error": "access_token_enc_too_large"})
+
+    kms_key_id = str(raw.get("kms_key_id") or os.environ.get("KMS_KEY_ID") or "").strip()
+    if not kms_key_id:
+        return _resp(
+            500,
+            {
+                "error": "kms_key_id_missing",
+                "hint": "Admin Lambda needs KMS_KEY_ID or pass kms_key_id in JSON body",
+            },
+        )
+
+    shop_hint = raw.get("shop")
+    shop_audit = (
+        str(shop_hint).strip().lower().rstrip("/")
+        if isinstance(shop_hint, str) and shop_hint.strip()
+        else "gwofy-internal-audit"
+    )
+
+    def _audit(outcome: str, detail: dict[str, Any]) -> None:
+        try:
+            append_audit(
+                table,
+                shop_audit,
+                actor_type="admin",
+                actor_id=actor_sub,
+                action="ADMIN_DECRYPT_SHOPIFY_TOKEN",
+                outcome=outcome,
+                resource="kms",
+                detail=detail,
+                http_path="/admin/tools/decrypt-shopify-token",
+                request_id=req_id,
+                actor_email=actor_email or None,
+            )
+        except Exception:
+            logger.exception("admin_decrypt_audit_append_failed")
+
+    try:
+        plain = decrypt_token(kms_key_id, enc)
+    except Exception as e:
+        logger.warning(
+            "admin_decrypt_shopify_token_failed",
+            extra={"sub": actor_sub, "detail": str(e)[:300]},
+        )
+        _audit(
+            "error",
+            {
+                "ciphertext_b64_len": len(enc),
+                "kms_key_id_suffix": kms_key_id[-32:],
+                "error": str(e)[:400],
+            },
+        )
+        return _resp(502, {"error": "decrypt_failed", "detail": str(e)[:400]})
+
+    _audit(
+        "ok",
+        {
+            "ciphertext_b64_len": len(enc),
+            "plaintext_len": len(plain),
+            "kms_key_id_suffix": kms_key_id[-32:],
+        },
+    )
+    return _resp(200, {"ok": True, "access_token": plain})
 
 
 def _put_supported_currencies(event, table, actor_sub: str, actor_email: str, req_id: str):
@@ -485,12 +573,18 @@ def _post_admin_sync_shop_currencies(event, table, shop: str, actor_sub: str, ac
     if not enc:
         return _resp(400, {"error": "missing_access_token"})
     kms_key_id = os.environ["KMS_KEY_ID"]
-    key_id = str(meta.get("kms_key_id") or kms_key_id)
     try:
-        token = decrypt_token(key_id, str(enc))
+        token = get_fresh_shop_access_token(
+            table,
+            shop,
+            kms_key_id_fallback=kms_key_id,
+            client_id=os.environ["SHOPIFY_CLIENT_ID"],
+            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+            meta=meta,
+        )
     except Exception as e:
-        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
-    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+        return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     fb = str(meta.get("shop_currency_code") or "").strip().upper()
     try:
         codes = sync_shop_enabled_currencies(

@@ -12,7 +12,6 @@ import boto3
 from lib.activate_app import ActivateAppError, run_activate_app_safe
 from lib.audit import append_audit
 from lib.cart_config_response import build_cart_plugin_response
-from lib.kms_tokens import decrypt_token
 from lib.shipping_country_defaults import is_country_supported
 from lib.logging_json import setup_logging
 from lib.merchant_premium_rules import normalize_for_storage, parse_rules_from_meta, validate_rules
@@ -20,6 +19,8 @@ from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
+from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.shopify_api import DEFAULT_API_VERSION
 
 logger = setup_logging("merchant_api")
 
@@ -152,7 +153,7 @@ def _send_sqs_profile(shop: str, store_number: str) -> None:
     q = os.environ.get("WORK_QUEUE_URL")
     if not q:
         return
-    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     sqs.send_message(
         QueueUrl=q,
         MessageBody=json.dumps(
@@ -192,14 +193,20 @@ def _activate(table, shop_host: str, payload: dict, headers: dict, req_id: str):
     if not enc:
         return _resp(400, {"error": "missing_access_token"})
     kms_key_id = os.environ["KMS_KEY_ID"]
-    key_id = str(item.get("kms_key_id") or kms_key_id)
     try:
-        shop_token = decrypt_token(key_id, str(enc))
+        shop_token = get_fresh_shop_access_token(
+            table,
+            shop_host,
+            kms_key_id_fallback=kms_key_id,
+            client_id=os.environ["SHOPIFY_CLIENT_ID"],
+            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+            meta=item,
+        )
     except Exception as e:
-        logger.exception("activate_token_decrypt_failed", extra={"shop": shop_host})
-        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
+        logger.exception("activate_token_resolve_failed", extra={"shop": shop_host})
+        return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
 
-    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     actor_sub = str(payload.get("sub") or "")
     try:
         run_activate_app_safe(
@@ -356,13 +363,19 @@ def _sync_shop_currencies(table, shop_host: str, payload: dict, headers: dict, r
     if not enc:
         return _resp(400, {"error": "missing_access_token"})
     kms_key_id = os.environ["KMS_KEY_ID"]
-    key_id = str(item.get("kms_key_id") or kms_key_id)
     try:
-        shop_token = decrypt_token(key_id, str(enc))
+        shop_token = get_fresh_shop_access_token(
+            table,
+            shop_host,
+            kms_key_id_fallback=kms_key_id,
+            client_id=os.environ["SHOPIFY_CLIENT_ID"],
+            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+            meta=item,
+        )
     except Exception as e:
-        logger.exception("sync_currencies_token_decrypt_failed", extra={"shop": shop_host})
-        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
-    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+        logger.exception("sync_currencies_token_resolve_failed", extra={"shop": shop_host})
+        return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     fb = str(item.get("shop_currency_code") or "").strip().upper()
     try:
         codes = sync_shop_enabled_currencies(

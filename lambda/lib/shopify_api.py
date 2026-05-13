@@ -7,11 +7,14 @@ import binascii
 import hashlib
 import hmac
 import json
+import logging
 import time
 from typing import Any
 import requests
 
-DEFAULT_API_VERSION = "2024-10"
+_log = logging.getLogger(__name__)
+
+DEFAULT_API_VERSION = "2026-04"
 
 
 def verify_oauth_hmac(query_params: dict[str, str], client_secret: str) -> bool:
@@ -42,12 +45,63 @@ def verify_webhook_hmac(raw_body: bytes, hmac_header: str, client_secret: str) -
 
 
 def exchange_token(shop: str, client_id: str, client_secret: str, code: str) -> dict[str, Any]:
-    """POST /admin/oauth/access_token — required REST endpoint."""
+    """POST /admin/oauth/access_token — expiring offline tokens (Shopify Dec 2025+)."""
     url = f"https://{shop}/admin/oauth/access_token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "expiring": "1",
+    }
     r = requests.post(
         url,
-        json={"client_id": client_id, "client_secret": client_secret, "code": code},
-        headers={"Content-Type": "application/json"},
+        data=data,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def refresh_offline_access_token(
+    shop: str, client_id: str, client_secret: str, refresh_token: str
+) -> dict[str, Any]:
+    """Rotate expiring offline access + refresh tokens (grant_type=refresh_token)."""
+    url = f"https://{shop}/admin/oauth/access_token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    r = requests.post(
+        url,
+        data=data,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def migrate_non_expiring_offline_token(
+    shop: str, client_id: str, client_secret: str, subject_access_token: str
+) -> dict[str, Any]:
+    """One-time: exchange legacy non-expiring offline token for expiring pair (revokes subject)."""
+    url = f"https://{shop}/admin/oauth/access_token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": subject_access_token,
+        "subject_token_type": "urn:shopify:params:oauth:token-type:offline-access-token",
+        "requested_token_type": "urn:shopify:params:oauth:token-type:offline-access-token",
+        "expiring": "1",
+    }
+    r = requests.post(
+        url,
+        data=data,
+        headers={"Accept": "application/json"},
         timeout=30,
     )
     r.raise_for_status()
@@ -83,6 +137,15 @@ def graphql_request(
         if r.status_code >= 500 and attempt < max_retries:
             time.sleep(min(2**attempt, 30))
             continue
+        if r.status_code >= 400:
+            _log.warning(
+                "shopify_admin_http_error",
+                extra={
+                    "status": r.status_code,
+                    "url": url,
+                    "body_preview": (r.text or "")[:1200],
+                },
+            )
         r.raise_for_status()
         return r.json()
 

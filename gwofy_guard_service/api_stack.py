@@ -135,7 +135,7 @@ class ApiStack(Stack):
             "WORK_QUEUE_URL": work_queue.queue_url,
             "SHOPIFY_CLIENT_ID": cid,
             "SHOPIFY_CLIENT_SECRET": csec,
-            "SHOPIFY_API_VERSION": self.node.try_get_context("shopify_api_version") or "2024-10",
+            "SHOPIFY_API_VERSION": self.node.try_get_context("shopify_api_version") or "2026-04",
             "WEBHOOK_BASE_URL": webhook_base_url
             or self.node.try_get_context("webhook_base_url")
             or "",
@@ -353,6 +353,7 @@ class ApiStack(Stack):
                 work_queue,
                 batch_size=5,
                 max_batching_window=Duration.seconds(5),
+                report_batch_item_failures=True,
             )
         )
 

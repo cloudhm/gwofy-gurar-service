@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -11,9 +12,9 @@ import boto3
 
 from lib.customer_order_sync import sync_orders
 from lib.feishu import send_text
-from lib.kms_tokens import decrypt_token
 from lib.logging_json import setup_logging
 from lib.models import SK_METADATA, SK_WEBHOOK_PROCESSED, pk_shop, pk_tenant, pk_webhook
+from lib.shop_offline_access import get_fresh_shop_access_token
 from lib.shop_archive import archive_and_delete_shop
 from lib.activity_config import ensure_activity_info_seed
 from lib.calc_coverage_tips_config import ensure_calc_coverage_tips_seed
@@ -33,6 +34,72 @@ ddb = boto3.resource("dynamodb")
 kms_key_id_env = None
 
 
+def _shop_admin_token(table, shop: str, kms_key_id: str) -> str:
+    return get_fresh_shop_access_token(
+        table,
+        shop,
+        kms_key_id_fallback=kms_key_id,
+        client_id=os.environ["SHOPIFY_CLIENT_ID"],
+        client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+    )
+
+
+def _sqs_record_audit(record: dict[str, Any]) -> dict[str, Any]:
+    attrs = record.get("attributes") or {}
+    return {
+        "sqs_message_id": record.get("messageId") or "",
+        "sqs_receive_count": attrs.get("ApproximateReceiveCount") or "",
+        "sqs_sent_timestamp": attrs.get("SentTimestamp") or "",
+        "sqs_first_receive_timestamp": attrs.get("ApproximateFirstReceiveTimestamp") or "",
+    }
+
+
+def _job_summary(body: dict[str, Any]) -> dict[str, Any]:
+    """Safe one-line context for CloudWatch (no tokens, no webhook bodies)."""
+    src = body.get("source")
+    summary: dict[str, Any] = {
+        "job_source": src,
+        "job_event": body.get("event"),
+        "shop": body.get("shop"),
+        "store_number": body.get("store_number"),
+    }
+    if src == "webhook_ingress":
+        headers = {k.lower(): v for k, v in (body.get("headers") or {}).items()}
+        summary["webhook_topic"] = headers.get("x-shopify-topic") or ""
+        wid = (headers.get("x-shopify-webhook-id") or "").strip()
+        summary["webhook_id"] = wid[:48] if wid else ""
+        summary["webhook_body_len"] = len(body.get("body") or "")
+    if src == "reconcile":
+        summary["reconcile_resource"] = body.get("resource")
+    return summary
+
+
+def _oauth_install_job_sort_key(body: dict[str, Any]) -> int:
+    """Within one Lambda invocation, run lightweight install jobs before INITIAL_SYNC."""
+    if body.get("source") != "oauth":
+        return 100
+    ev = body.get("event")
+    if ev == "APP_INSTALLED":
+        return 0
+    if ev == "INITIAL_SYNC":
+        return 1
+    return 50
+
+
+def _sort_worker_sqs_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stable order: APP_INSTALLED → other oauth → INITIAL_SYNC; tie-break by receive order."""
+    keyed: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for i, rec in enumerate(records):
+        try:
+            body = json.loads(rec.get("body") or "")
+        except json.JSONDecodeError:
+            keyed.append(((999, i), rec))
+            continue
+        keyed.append(((_oauth_install_job_sort_key(body), i), rec))
+    keyed.sort(key=lambda t: t[0])
+    return [rec for _, rec in keyed]
+
+
 def handler(event, context):
     table_name = os.environ["TABLE_NAME"]
     kms_key_id = os.environ["KMS_KEY_ID"]
@@ -40,13 +107,47 @@ def handler(event, context):
     feishu_url = os.environ.get("FEISHU_WEBHOOK_URL", "")
     table = ddb.Table(table_name)
 
-    for record in event.get("Records", []):
-        body = json.loads(record["body"])
+    raw_records = event.get("Records", [])
+    records = _sort_worker_sqs_records(raw_records)
+    req_id = getattr(context, "aws_request_id", "") or ""
+    logger.info(
+        "worker_sqs_batch_start",
+        extra={
+            "record_count": len(records),
+            "lambda_request_id": req_id,
+            "sqs_reordered": records != raw_records,
+        },
+    )
+
+    batch_item_failures: list[dict[str, str]] = []
+
+    for record in records:
+        sqs_ctx = _sqs_record_audit(record)
+        t0 = time.perf_counter()
+        msg_id = record.get("messageId") or ""
+        try:
+            body = json.loads(record["body"])
+        except json.JSONDecodeError:
+            logger.exception("worker_sqs_body_invalid_json", extra=sqs_ctx)
+            if msg_id:
+                batch_item_failures.append({"itemIdentifier": msg_id})
+            continue
+        job = _job_summary(body)
+        logger.info("worker_sqs_record_start", extra={**sqs_ctx, **job})
         try:
             route_message(table, body, kms_key_id, api_version, feishu_url)
         except Exception:
-            logger.exception("worker_record_failed", extra={"body_preview": json.dumps(body)[:300]})
-            raise
+            logger.exception(
+                "worker_record_failed",
+                extra={**sqs_ctx, **job, "body_preview": json.dumps(body, default=str)[:300]},
+            )
+            if msg_id:
+                batch_item_failures.append({"itemIdentifier": msg_id})
+            continue
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info("worker_sqs_record_done", extra={**sqs_ctx, **job, "duration_ms": duration_ms})
+
+    return {"batchItemFailures": batch_item_failures}
 
 
 def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str, feishu_url: str) -> None:
@@ -76,8 +177,7 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
         enc = meta.get("access_token_enc")
         if not enc:
             return
-        key_id = meta.get("kms_key_id") or kms_key_id
-        token = decrypt_token(key_id, enc)
+        token = _shop_admin_token(table, shop, kms_key_id)
         ver = body.get("api_version") or api_version
         if ev == "SHOP_PROFILE_SYNC":
             sync_shop_profile(table, shop, token, ver)
@@ -104,6 +204,7 @@ def _shop_row(table, shop: str) -> dict[str, Any] | None:
 
 
 def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:
+    logger.info("initial_sync_start", extra={"shop": shop, "store_number": store_number, "api_version": api_version})
     meta = _shop_row(table, shop)
     if not meta or meta.get("installation_status") != "ACTIVE":
         logger.info("skip_sync_not_active", extra={"shop": shop})
@@ -112,21 +213,24 @@ def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
     if not enc:
         logger.warning("skip_sync_no_token", extra={"shop": shop})
         return
-    key_id = meta.get("kms_key_id") or kms_key_id
-    token = decrypt_token(key_id, enc)
+    token = _shop_admin_token(table, shop, kms_key_id)
     ensure_default_pricing_seed(os.environ["TABLE_NAME"])
     ensure_shipping_country_defaults_seed(os.environ["TABLE_NAME"])
     ensure_max_coverage_seed(os.environ["TABLE_NAME"])
     ensure_activity_info_seed(os.environ["TABLE_NAME"])
     ensure_tips_info_seed(os.environ["TABLE_NAME"])
     ensure_calc_coverage_tips_seed(os.environ["TABLE_NAME"])
+    logger.info("initial_sync_phase", extra={"phase": "shop_profile", "shop": shop})
     sync_shop_profile(table, shop, token, api_version)
     meta = _shop_row(table, shop) or {}
     protection_gid = meta.get("protection_product_gid")
+    logger.info("initial_sync_phase", extra={"phase": "products", "shop": shop})
     sync_products_initial(table, shop, store_number, token, api_version)
+    logger.info("initial_sync_phase", extra={"phase": "orders", "shop": shop})
     sync_orders(
         table, shop, store_number, token, api_version, protection_product_gid=protection_gid
     )
+    logger.info("initial_sync_complete", extra={"shop": shop, "store_number": store_number})
 
 
 def _advance_reconcile_marker(table, shop: str, resource: str) -> None:
@@ -214,8 +318,7 @@ def _execute_webhook_envelope(
     store_number = str(meta.get("store_number", ""))
     if not enc:
         return
-    key_id = meta.get("kms_key_id") or kms_key_id
-    token = decrypt_token(key_id, enc)
+    token = _shop_admin_token(table, shop, kms_key_id)
 
     if t in ("shop/update", "markets/create", "markets/update"):
         try:

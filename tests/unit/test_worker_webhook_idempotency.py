@@ -33,7 +33,7 @@ def test_duplicate_webhook_id_skips_handler(mock_uninstall):
     }
 
     process_webhook_envelope(
-        table, _envelope(wid, "app/uninstalled"), "kms-alias", "2024-10", ""
+        table, _envelope(wid, "app/uninstalled"), "kms-alias", "2026-04", ""
     )
 
     mock_uninstall.assert_not_called()
@@ -47,7 +47,7 @@ def test_first_delivery_runs_then_marks(mock_uninstall):
     table.get_item.return_value = {}
 
     process_webhook_envelope(
-        table, _envelope(wid, "app/uninstalled"), "kms-alias", "2024-10", ""
+        table, _envelope(wid, "app/uninstalled"), "kms-alias", "2026-04", ""
     )
 
     mock_uninstall.assert_called_once()
@@ -66,7 +66,7 @@ def test_empty_webhook_id_no_dedupe_row(mock_uninstall):
     env = _envelope("", "app/uninstalled")
     env["headers"]["x-shopify-webhook-id"] = ""
 
-    process_webhook_envelope(table, env, "kms-alias", "2024-10", "")
+    process_webhook_envelope(table, env, "kms-alias", "2026-04", "")
 
     mock_uninstall.assert_called_once()
     dedupe_puts = [

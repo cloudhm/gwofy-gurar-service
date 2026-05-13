@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 
-from lib.kms_tokens import encrypt_token
+from lib.kms_tokens import encrypt_refresh_token, encrypt_token
 from lib.logging_json import setup_logging
 from lib.models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
 from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, verify_oauth_hmac
@@ -65,6 +65,7 @@ def handler(event, context):
     table = ddb.Table(table_name)
     pk = pk_shop(shop)
     now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
     prev = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item") or {}
     installed_at = str(prev.get("installed_at") or now)
 
@@ -88,6 +89,22 @@ def handler(event, context):
         "gsi2pk": GSI2_PK_SHOP_INDEX,
         "gsi2sk": f"{installed_at}#{shop}",
     }
+    rt = token_resp.get("refresh_token")
+    exp_in = int(token_resp.get("expires_in") or 0)
+    rt_exp_in = int(token_resp.get("refresh_token_expires_in") or 0)
+    if isinstance(rt, str) and rt.strip() and exp_in > 0 and rt_exp_in > 0:
+        item["refresh_token_enc"] = encrypt_refresh_token(kms_key_id, rt.strip())
+        item["shopify_offline_access_token_expires_at"] = (
+            now_dt + timedelta(seconds=exp_in)
+        ).isoformat()
+        item["shopify_offline_refresh_token_expires_at"] = (
+            now_dt + timedelta(seconds=rt_exp_in)
+        ).isoformat()
+    else:
+        logger.warning(
+            "oauth_token_response_missing_expiring_fields",
+            extra={"shop": shop, "keys": list(token_resp.keys())},
+        )
     for k in (
         "activation_status",
         "protection_product_gid",
@@ -113,13 +130,24 @@ def handler(event, context):
         "store_number": store_number,
         "api_version": api_version,
     }
-    sqs.send_message(
+    # APP_INSTALLED first so the worker can notify (e.g. Feishu) before long INITIAL_SYNC;
+    # INITIAL_SYNC failures must not block install notification (see SqsEventSource partial batch).
+    r_installed = sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),
+    )
+    r_sync = sqs.send_message(
         QueueUrl=queue_url,
         MessageBody=json.dumps({**internal, "event": "INITIAL_SYNC"}),
     )
-    sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),
+    logger.info(
+        "oauth_work_queue_enqueued",
+        extra={
+            "shop": shop,
+            "store_number": store_number,
+            "initial_sync_sqs_message_id": r_sync.get("MessageId"),
+            "app_installed_sqs_message_id": r_installed.get("MessageId"),
+        },
     )
 
     location = _post_install_redirect_location(shop, client_id)

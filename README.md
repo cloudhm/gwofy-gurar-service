@@ -196,6 +196,8 @@ jobs:
 
 5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。
 
+   **可过期离线 token（Shopify 2025-12+）**：向 `https://{shop}/admin/oauth/authorize` 发起 **offline** 授权时，查询串须包含 **`expiring=1`**（与 [Shopify 文档](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens) 一致）。本仓库 `/oauth/callback` 换票已固定带 **`expiring=1`**，并在 Dynamo **METADATA** 写入 `refresh_token_enc`、`shopify_offline_access_token_expires_at`、`shopify_offline_refresh_token_expires_at`。Worker / 商户 / 管理接口在调用 Admin API 前会 **自动 refresh**；若仍为历史 **非过期** token，会在首次请求时 **一次性迁移** 为可过期对（旧 token 随即作废）。仅用 `POST /admin/tools/decrypt-shopify-token` 取出的明文若未经过上述逻辑，在 Postman 里可能仍被 Shopify 拒绝，请触发任意已接线路径或重装授权。
+
 ### 自定义域名（gwofy.com）
 
 约定：**子域名为 `sp-{stage}` + 根域名 `gwofy.com`**，与 CDK `stage` 一致。例如：
@@ -277,6 +279,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）
   - `GET /admin/shops/{shop}`（`shop` 需 URL 编码；`shop` 对象内含 **`shop_enabled_currencies`** 解析数组，便于配置保额 UI）
   - `GET /admin/shops/{shop}/detail` — 与上一行相同返回完整 **`shop`** METADATA（**不脱敏**，含 `access_token_enc` 等，仅限可信管理环境）；并返回 **`merchantPremiumRules`**（解析自 `merchant_premium_rules_json`）。若存储 JSON 无效则 **`merchantPremiumRules`** 为默认空规则且可能带 **`merchant_premium_rules_parse_warning`**。
+  - `POST /admin/tools/decrypt-shopify-token`，body：`{"access_token_enc":"<KMS Base64 密文>","kms_key_id":"<可选，缺省用 Lambda KMS_KEY_ID>","shop":"<可选，审计归属店铺 host；缺省为内部占位>"}` → **200** `{"ok":true,"access_token":"<明文 Shopify token>"}`（**极高敏感**，仅管理组；失败 **502** `decrypt_failed`；写审计 **`ADMIN_DECRYPT_SHOPIFY_TOKEN`**，**detail 不含明文**）
   - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
   - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
