@@ -14,6 +14,7 @@ SK_CALC_COVERAGE_TIPS = "CALC_COVERAGE_TIPS"
 # Shop METADATA overrides for cart calc tips (inherit global when absent).
 META_SP_BELOW_MIN_COVERAGE_TIP = "sp_below_min_coverage_tip"
 META_SP_GREATER_MAX_COVERAGE_TIP = "sp_greater_max_coverage_tip"
+MERCHANT_PREMIUM_RULES_JSON = "merchant_premium_rules_json"
 GSI2_PK_SHOP_INDEX = "SHOP_INDEX"
 SK_AUDIT_PREFIX = "AUDIT#"
 

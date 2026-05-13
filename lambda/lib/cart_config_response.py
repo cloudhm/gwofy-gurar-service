@@ -12,6 +12,7 @@ from .tips_config import get_tips_info
 from .default_protection_tiers import PROTECTION_PRODUCT_HANDLE
 from .pricing_config import get_pricing_model, get_supported_currencies
 from .max_coverage_config import effective_max_coverage_for_cart
+from .merchant_premium_rules import parse_rules_from_meta
 from .shipping_country_defaults import effective_rate
 
 
@@ -65,6 +66,7 @@ def build_cart_plugin_response(
     activity = get_activity_info(table)
     tips = get_tips_info(table)
     calc_tips = effective_calc_coverage_tips(table, meta)
+    premium_rules, _premium_warn = parse_rules_from_meta(table, meta)
 
     return {
         "auth": {
@@ -117,6 +119,7 @@ def build_cart_plugin_response(
             "spGreaterMaxCoverageTip": calc_tips["spGreaterMaxCoverageTip"],
             "spRate": rate_s,
         },
+        "merchantPremiumRules": premium_rules,
         "configuration": {
             "calcVersion": "v1-0-3",
             "commonVersion": "v1-0-5",

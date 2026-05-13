@@ -46,6 +46,7 @@ from lib.max_coverage_config import (
     put_global_max_coverage_by_currency,
     validate_shop_max_coverage_by_currency,
 )
+from lib.merchant_premium_rules import parse_rules_from_meta
 from lib.kms_tokens import decrypt_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
@@ -162,6 +163,8 @@ def handler(event, context):
 
     if method == "GET" and len(parts) == 3:
         return _get_shop(table, shop, actor_sub, req_id)
+    if method == "GET" and len(parts) == 4 and parts[3] == "detail":
+        return _get_shop_detail(table, shop, actor_sub, req_id)
     if method == "GET" and len(parts) == 4 and parts[3] == "products":
         return _list_products(table, shop, actor_sub, req_id)
     if method == "GET" and len(parts) == 4 and parts[3] == "orders":
@@ -666,6 +669,19 @@ def _get_shop(table, shop: str, actor_sub: str, req_id: str):
     out = dict(it)
     out["shop_enabled_currencies"] = sorted(parse_shop_enabled_currencies_json(it))
     return _resp(200, {"shop": out})
+
+
+def _get_shop_detail(table, shop: str, actor_sub: str, req_id: str):
+    it = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
+    if not it:
+        return _resp(404, {"error": "not_found"})
+    out = dict(it)
+    out["shop_enabled_currencies"] = sorted(parse_shop_enabled_currencies_json(it))
+    rules, warn = parse_rules_from_meta(table, it)
+    payload: dict[str, Any] = {"shop": out, "merchantPremiumRules": rules}
+    if warn:
+        payload["merchant_premium_rules_parse_warning"] = warn
+    return _resp(200, payload)
 
 
 def _list_products(table, shop: str, actor_sub: str, req_id: str):

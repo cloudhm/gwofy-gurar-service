@@ -421,8 +421,8 @@ class ApiStack(Stack):
             integration=merchant_integ,
         )
         http_api.add_routes(
-            path="/api/shop-enabled-currencies/sync",
-            methods=[apigwv2.HttpMethod.POST],
+            path="/api/me/merchant-premium-rules",
+            methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
             integration=merchant_integ,
         )
 

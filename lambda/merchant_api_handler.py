@@ -15,7 +15,8 @@ from lib.cart_config_response import build_cart_plugin_response
 from lib.kms_tokens import decrypt_token
 from lib.shipping_country_defaults import is_country_supported
 from lib.logging_json import setup_logging
-from lib.models import SK_METADATA, pk_shop
+from lib.merchant_premium_rules import normalize_for_storage, parse_rules_from_meta, validate_rules
+from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
@@ -75,6 +76,10 @@ def handler(event, context):
         return _embed_ack(event, table, shop_host, payload, headers, req_id)
     if method == "POST" and path == "/api/shop-enabled-currencies/sync":
         return _sync_shop_currencies(table, shop_host, payload, headers, req_id)
+    if method == "GET" and path == "/api/me/merchant-premium-rules":
+        return _get_merchant_premium_rules(table, shop_host, payload, headers, req_id)
+    if method == "PUT" and path == "/api/me/merchant-premium-rules":
+        return _put_merchant_premium_rules(event, table, shop_host, payload, headers, req_id)
 
     return _resp(404, {"error": "not_found"})
 
@@ -249,6 +254,90 @@ def _embed_ack(event, table, shop_host: str, payload: dict, headers: dict, req_i
         outcome="ok",
         detail={"embed_enabled_ack": ack},
         http_path="/api/me/embed",
+        request_id=req_id,
+        source_ip=_xff(headers),
+    )
+    return _resp(200, {"ok": True})
+
+
+def _require_merchant_shop_active(
+    table, shop_host: str, payload: dict, headers: dict, req_id: str, *, http_path: str, audit_action: str
+):
+    item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    if not item:
+        return None, _resp(404, {"error": "shop_not_installed"})
+    if item.get("installation_status") != "ACTIVE":
+        return None, _resp(400, {"error": "shop_not_active"})
+    if item.get("plugin_suspended"):
+        append_audit(
+            table,
+            shop_host,
+            actor_type="merchant",
+            actor_id=str(payload.get("sub") or ""),
+            action=audit_action,
+            outcome="blocked",
+            http_path=http_path,
+            request_id=req_id,
+            source_ip=_xff(headers),
+        )
+        return None, _resp(403, {"error": "plugin_suspended"})
+    return item, None
+
+
+def _get_merchant_premium_rules(table, shop_host: str, payload: dict, headers: dict, req_id: str):
+    item, err = _require_merchant_shop_active(
+        table,
+        shop_host,
+        payload,
+        headers,
+        req_id,
+        http_path="/api/me/merchant-premium-rules",
+        audit_action="MERCHANT_PREMIUM_RULES_GET",
+    )
+    if err:
+        return err
+    rules, _warn = parse_rules_from_meta(table, item)
+    return _resp(200, {"merchantPremiumRules": rules})
+
+
+def _put_merchant_premium_rules(event, table, shop_host: str, payload: dict, headers: dict, req_id: str):
+    item, err = _require_merchant_shop_active(
+        table,
+        shop_host,
+        payload,
+        headers,
+        req_id,
+        http_path="/api/me/merchant-premium-rules",
+        audit_action="MERCHANT_PREMIUM_RULES_PUT",
+    )
+    if err:
+        return err
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body_must_be_object"})
+    verr = validate_rules(table, body)
+    if verr:
+        return _resp(400, {"error": "invalid_merchant_premium_rules", "detail": verr})
+    now = datetime.now(timezone.utc).isoformat()
+    stored = normalize_for_storage(body)
+    table.update_item(
+        Key={"pk": pk_shop(shop_host), "sk": SK_METADATA},
+        UpdateExpression="SET #mr = :mr, #u = :u",
+        ExpressionAttributeNames={"#mr": MERCHANT_PREMIUM_RULES_JSON, "#u": "updated_at"},
+        ExpressionAttributeValues={":mr": stored, ":u": now},
+    )
+    append_audit(
+        table,
+        shop_host,
+        actor_type="merchant",
+        actor_id=str(payload.get("sub") or ""),
+        action="MERCHANT_PREMIUM_RULES_PUT",
+        outcome="ok",
+        detail={"version": body.get("version")},
+        http_path="/api/me/merchant-premium-rules",
         request_id=req_id,
         source_ip=_xff(headers),
     )

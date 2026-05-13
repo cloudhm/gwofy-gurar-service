@@ -14,6 +14,16 @@ from lib.shopify_api import verify_webhook_hmac
 logger = setup_logging("webhook_ingress")
 sqs = boto3.client("sqs")
 
+# CloudWatch log event limit is 256 KiB; keep headroom for JSON/metadata.
+_MAX_HMAC_FAIL_BODY_CHARS = 200_000
+
+
+def _utf8_body_for_log(raw_body: bytes) -> tuple[str, bool]:
+    text = raw_body.decode("utf-8", errors="replace")
+    if len(text) <= _MAX_HMAC_FAIL_BODY_CHARS:
+        return text, False
+    return text[: _MAX_HMAC_FAIL_BODY_CHARS], True
+
 
 def handler(event, context):
     client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
@@ -34,7 +44,15 @@ def handler(event, context):
 
     hmac_header = headers.get("x-shopify-hmac-sha256") or ""
     if not verify_webhook_hmac(raw_body, hmac_header, client_secret):
-        logger.warning("webhook_hmac_failed", extra={"payload_len": len(raw_body)})
+        body_text, truncated = _utf8_body_for_log(raw_body)
+        logger.warning(
+            "webhook_hmac_failed",
+            extra={
+                "payload_len": len(raw_body),
+                "raw_body": body_text,
+                "raw_body_truncated": truncated,
+            },
+        )
         return {"statusCode": 401, "body": json.dumps({"error": "invalid_hmac"})}
 
     needed = [

@@ -247,8 +247,12 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 | GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link`、`last_activation_error`（激活失败时的 JSON 字符串，成功激活后清除）等 |
 | POST | `/api/activate` | **同步**激活或再次激活：商户 Lambda 内用店铺离线 token 创建/更新 Shipping Protection 商品并写回 `protection_product_gid`。成功 **200** `{"ok":true,"activation_status":"ACTIVATED"}`；业务错误 **400**（如 `shop_profile_not_ready`、`currency_not_supported`、`pricing_not_configured`）；解密/Shopify 异常 **500/502**。激活**不会**调用 `sync_shop_profile`；`shop_currency_code` 须已由安装全量同步 / webhook / 定时对账写入 METADATA。HTTP API 与 Lambda 超时请见栈配置（商户 Lambda 已放宽以便多变体 upsert）。 |
 | PATCH | `/api/me/embed` | JSON body：`{"embed_enabled_ack": true}` |
-| POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）、`shopDomain`。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`（`country` 仅用于 **费率** 等，**不参与保额**）。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。**响应** `calcInfo` 含 **`maxAmount`**、**`maxAmountCurrency`**（按店铺结算货币从全局/店铺 **按币种保额** map 解析）、`spRate` 等。 |
+| POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）、`shopDomain`。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`（`country` 仅用于 **费率** 等，**不参与保额**）。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。**响应** `calcInfo` 含 **`maxAmount`**、**`maxAmountCurrency`**、`spRate` 等；并含 **`merchantPremiumRules`**（从店铺 `METADATA.merchant_premium_rules_json` 解析，与 **`GET /api/me/merchant-premium-rules`** 同源；无效或缺失时为默认空规则）。**服务端不下发最终加价后金额**， storefront / App 按规则自行计算。 |
+| GET | `/api/me/merchant-premium-rules` | 返回 **`{"merchantPremiumRules":{...}}`**（店主配置的加成 / 满减等；店铺须 **ACTIVE** 且未挂起）。 |
+| PUT | `/api/me/merchant-premium-rules` | JSON body 为完整规则对象（见 `lambda/lib/merchant_premium_rules.py` 校验）；写入 **`merchant_premium_rules_json`**。**400** `invalid_merchant_premium_rules` + `detail`。 |
 | POST | `/api/shop-enabled-currencies/sync` | **Session JWT**（与 `/api/me` 相同）。从 Shopify 拉取 **店铺已启用货币** 写入 `shop_enabled_currencies_json`；**200** `{"ok":true,"currencies":[...],"synced_at":"..."}`。配置 `sp_max_coverage_by_currency` 前若尚未同步会 **400** `shop_enabled_currencies_not_synced`。 |
+
+**店主规则语义摘要**（`merchantPremiumRules`）：`markup.default` 与 `markup.byCountry`（ISO2）为在平台档位价上的 **`addPercent`（%）** 与店铺结算货币下的 **`addFixed`**；`promotions` 为满减阶梯。字段 **`promotionApplyMode`** 当前仅支持 **`highest_threshold_wins`**：客户端在购物车小计满足条件的规则中，仅采用 **`minCartSubtotal` 最大** 的一条折扣（不累加）。建议计算顺序：**平台档位价 → markup → 满减**；与 Shopify 结账变体标价是否一致由 App 侧处理。
 
 可选环境变量（CDK 写入 Worker / 商户 Lambda，也可用 `-c` context）：`ORDER_PROTECTION_TAG`（默认 `gwofy-shipping-protection`）— 仅用于在 **本系统 DynamoDB 订单镜像** 上写入 `sync_tags`（**不会**调用 Shopify 修改商户订单）。
 
@@ -258,7 +262,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 **全局保额（按币种，不按国）**：`GLOBAL#CONFIG` / **`MAX_COVERAGE_BY_CURRENCY`**。`GET/PUT /admin/config/max-coverage-by-currency`，body：`{"amounts":{"USD":9000,"EUR":8200}}`（键须为管理员允许列表中的 ISO 4217）。
 
-**店铺覆盖**：`PUT /admin/shops/{shop}/shipping-calc-settings` 可更新 `sp_market_rates`（按国 **费率**）、`sp_max_coverage_usd`（legacy 全店 USD 兜底）、**`sp_max_coverage_by_currency`**（按 **币种** 覆盖保额，与全局 merge；键须为 **店铺已启用货币 ∩ 平台允许**）。**`sp_country_max_overrides` 已废弃**（**400** `deprecated_sp_country_max_overrides`）。写入 `sp_max_coverage_by_currency` 前须先 **`POST /api/shop-enabled-currencies/sync`** 或 **`POST /admin/shops/{shop}/sync-enabled-currencies`**（否则 **400** `shop_enabled_currencies_not_synced`）。**有效费率** = 店铺该国 `sp_market_rates`（若有）否则全局该国 `rate`。**有效保额** = 全局 `amounts` 与店铺 `sp_max_coverage_by_currency_json` 按币种 merge 后，取 **`shop_currency_code`** 对应金额（无则 `USD`，再无则 `sp_max_coverage_usd`，最后 9000）。OAuth / `INITIAL_SYNC` / `sync_shop_profile` 会拉取 **店铺启用货币** 列表。Partner 需 **`read_markets`**；读取 `currencySettings` 建议含 **`read_shop`**（见 `shopify.app.toml`）。
+**店铺覆盖**：`PUT /admin/shops/{shop}/shipping-calc-settings`（**Gwofy 管理员**配置）可更新 `sp_market_rates`（按国 **费率**）、`sp_max_coverage_usd`（legacy 全店 USD 兜底）、**`sp_max_coverage_by_currency`**（按 **币种** 覆盖保额，与全局 merge；键须为 **店铺已启用货币 ∩ 平台允许**）。店主自定义的保费加减 / 满减规则 **不在此接口**，由店主在 App 内调用 **`PUT /api/me/merchant-premium-rules`**。**`sp_country_max_overrides` 已废弃**（**400** `deprecated_sp_country_max_overrides`）。写入 `sp_max_coverage_by_currency` 前须先 **`POST /api/shop-enabled-currencies/sync`** 或 **`POST /admin/shops/{shop}/sync-enabled-currencies`**（否则 **400** `shop_enabled_currencies_not_synced`）。**有效费率** = 店铺该国 `sp_market_rates`（若有）否则全局该国 `rate`。**有效保额** = 全局 `amounts` 与店铺 `sp_max_coverage_by_currency_json` 按币种 merge 后，取 **`shop_currency_code`** 对应金额（无则 `USD`，再无则 `sp_max_coverage_usd`，最后 9000）。OAuth / `INITIAL_SYNC` / `sync_shop_profile` 会拉取 **店铺启用货币** 列表。Partner 需 **`read_markets`**；读取 `currencySettings` 建议含 **`read_shop`**（见 `shopify.app.toml`）。
 
 ### 管理员（Cognito JWT + 用户组）
 
@@ -270,6 +274,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 - 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience = `AdminCognitoUserPoolClientId`）：
   - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）
   - `GET /admin/shops/{shop}`（`shop` 需 URL 编码；`shop` 对象内含 **`shop_enabled_currencies`** 解析数组，便于配置保额 UI）
+  - `GET /admin/shops/{shop}/detail` — 与上一行相同返回完整 **`shop`** METADATA（**不脱敏**，含 `access_token_enc` 等，仅限可信管理环境）；并返回 **`merchantPremiumRules`**（解析自 `merchant_premium_rules_json`）。若存储 JSON 无效则 **`merchantPremiumRules`** 为默认空规则且可能带 **`merchant_premium_rules_parse_warning`**。
   - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
   - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
