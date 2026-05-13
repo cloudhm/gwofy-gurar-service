@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -25,9 +27,18 @@ def verify_oauth_hmac(query_params: dict[str, str], client_secret: str) -> bool:
 
 
 def verify_webhook_hmac(raw_body: bytes, hmac_header: str, client_secret: str) -> bool:
+    """Verify `X-Shopify-Hmac-Sha256` (Base64 of raw SHA256 HMAC digest, not hex)."""
+    sig = (hmac_header or "").strip()
+    if not sig:
+        return False
     digest = hmac.new(client_secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
-    computed = digest.hex()
-    return hmac.compare_digest(computed, hmac_header)
+    try:
+        received = base64.b64decode(sig, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    if len(received) != len(digest):
+        return False
+    return hmac.compare_digest(digest, received)
 
 
 def exchange_token(shop: str, client_id: str, client_secret: str, code: str) -> dict[str, Any]:

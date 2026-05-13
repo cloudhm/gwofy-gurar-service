@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, urlparse
 
 import boto3
 
@@ -19,6 +18,26 @@ logger = setup_logging("oauth")
 
 ddb = boto3.resource("dynamodb")
 sqs = boto3.client("sqs")
+
+# Partner Dashboard app URL handle (path segment after /apps/).
+_SHOPIFY_ADMIN_APP_HANDLE = "gwofy-guard"
+
+
+def _shop_admin_slug(shop: str) -> str:
+    """`storename.myshopify.com` -> `storename` for admin.shopify.com/store/... URLs."""
+    s = shop.strip().lower().rstrip("/")
+    suffix = ".myshopify.com"
+    if s.endswith(suffix):
+        return s[: -len(suffix)]
+    return s
+
+
+def _post_install_redirect_location(shop: str) -> str:
+    custom = (os.environ.get("POST_INSTALL_REDIRECT_URL") or "").strip()
+    if custom:
+        return custom
+    slug = _shop_admin_slug(shop)
+    return f"https://admin.shopify.com/store/{slug}/apps/{_SHOPIFY_ADMIN_APP_HANDLE}"
 
 
 def handler(event, context):
@@ -136,19 +155,8 @@ def handler(event, context):
         MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),
     )
 
-    redirect = os.environ.get("POST_INSTALL_REDIRECT_URL")
-    if redirect:
-        return {"statusCode": 302, "headers": {"Location": redirect}, "body": ""}
-
-    return _resp(
-        200,
-        {
-            "ok": True,
-            "shop": shop,
-            "store_number": store_number,
-            "message": "Installed; sync queued.",
-        },
-    )
+    location = _post_install_redirect_location(shop)
+    return {"statusCode": 302, "headers": {"Location": location}, "body": ""}
 
 
 def _resp(code: int, body: dict):

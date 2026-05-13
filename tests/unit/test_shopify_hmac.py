@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 
@@ -7,8 +8,9 @@ from lib.shopify_api import verify_oauth_hmac, verify_webhook_hmac
 def test_verify_webhook_hmac_accepts_valid_signature():
     secret = "test_secret"
     body = b'{"id":1}'
-    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    assert verify_webhook_hmac(body, digest, secret) is True
+    raw = hmac.new(secret.encode(), body, hashlib.sha256).digest()
+    header = base64.b64encode(raw).decode("ascii")
+    assert verify_webhook_hmac(body, header, secret) is True
 
 
 def test_verify_oauth_hmac_sorts_params():

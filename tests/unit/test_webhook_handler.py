@@ -2,7 +2,7 @@ import os
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-east-1")
 
-from webhook_handler import _utf8_body_for_log
+from webhook_handler import _request_snapshot, _utf8_body_for_log
 
 
 def test_utf8_body_for_log_short_body():
@@ -23,3 +23,49 @@ def test_utf8_body_for_log_invalid_utf8():
     assert truncated is False
     assert len(text) == 2
     assert text == "\ufffd\ufffd"
+
+
+def test_request_snapshot_rest_proxy_event():
+    event = {
+        "httpMethod": "POST",
+        "path": "/webhook",
+        "resource": "/webhook",
+        "headers": {"X-Shopify-Topic": "orders/create", "Host": "example.amazonaws.com"},
+        "multiValueHeaders": {"X-Foo": ["a", "b"]},
+        "queryStringParameters": {"foo": "bar"},
+        "multiValueQueryStringParameters": {"tag": ["x", "y"]},
+        "body": '{"id":1}',
+        "isBase64Encoded": False,
+        "requestContext": {"stage": "prod"},
+    }
+    snap = _request_snapshot(event, b'{"id":1}')
+    assert snap["http_method"] == "POST"
+    assert snap["path"] == "/webhook"
+    assert snap["resource"] == "/webhook"
+    assert snap["stage"] == "prod"
+    assert snap["query_string_parameters"] == {"foo": "bar"}
+    assert snap["multi_value_query_string_parameters"] == {"tag": ["x", "y"]}
+    assert snap["headers"]["X-Shopify-Topic"] == "orders/create"
+    assert snap["multi_value_headers"]["X-Foo"] == ["a", "b"]
+    assert snap["body_utf8"] == '{"id":1}'
+    assert snap["body_truncated"] is False
+    assert snap["body_len_bytes"] == 8
+
+
+def test_request_snapshot_http_api_v2_style():
+    event = {
+        "version": "2.0",
+        "rawPath": "/hook",
+        "rawQueryString": "a=1&b=2",
+        "requestContext": {"http": {"method": "POST"}},
+        "headers": {"x-shopify-topic": "app/uninstalled"},
+        "body": "e30=",
+        "isBase64Encoded": True,
+    }
+    snap = _request_snapshot(event, b"{}")
+    assert snap["event_version"] == "2.0"
+    assert snap["http_method"] == "POST"
+    assert snap["path"] == "/hook"
+    assert snap["raw_query_string"] == "a=1&b=2"
+    assert snap["is_base64_encoded"] is True
+    assert snap["body_utf8"] == "{}"
