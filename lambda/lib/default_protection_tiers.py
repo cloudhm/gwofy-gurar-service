@@ -7,6 +7,9 @@ from typing import Any
 # Fixed storefront / GraphQL product handle (not the same as Shopify storefront URL handle uniqueness).
 PROTECTION_PRODUCT_HANDLE = "GWOFY-SHIPPING-PROTECTION-QAQWER"
 
+# Vendor shown on the Shipping Protection product (create + productUpdate on every upsert).
+PROTECTION_PRODUCT_VENDOR = "GWOFY"
+
 # Default max cart coverage (USD) used to partition tiers; per-shop override in METADATA `sp_max_coverage_usd`.
 DEFAULT_COVERAGE_MAX_USD = 9000.0
 
@@ -125,7 +128,7 @@ def build_default_tiers(
         tiers.append(
             {
                 "plan_code": plan,
-                "price_usd": float(price_s),
+                "price": float(price_s),
             }
         )
     return tiers

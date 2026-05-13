@@ -30,10 +30,11 @@ def test_shop_to_usd():
 def test_hmac_roundtrip():
     secret = "testsecret"
     shop = "a.myshopify.com"
-    sig = storefront_hmac_sign(secret, shop, {"cart_subtotal": "99", "currency": "USD"})
-    canonical = '{"cart_subtotal":"99","currency":"USD"}'
+    payload = {"country": "US", "shopDomain": "https://a.myshopify.com"}
+    sig = storefront_hmac_sign(secret, shop, payload)
+    canonical = '{"country":"US","shopDomain":"https://a.myshopify.com"}'
     assert verify_shop_body_hmac(secret, shop, canonical, sig) is True
-    assert verify_shop_body_hmac(secret, shop, '{"currency":"USD","cart_subtotal":"99"}', sig) is False
+    assert verify_shop_body_hmac(secret, shop, '{"shopDomain":"https://a.myshopify.com","country":"US"}', sig) is False
 
 
 def test_order_has_protection():

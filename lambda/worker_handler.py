@@ -9,14 +9,17 @@ from typing import Any
 
 import boto3
 
-from lib.activate_app import run_activate_app_safe
-from lib.customer_order_sync import sync_customers, sync_orders
+from lib.customer_order_sync import sync_orders
 from lib.feishu import send_text
 from lib.kms_tokens import decrypt_token
 from lib.logging_json import setup_logging
 from lib.models import SK_METADATA, pk_shop, pk_tenant
 from lib.shop_archive import archive_and_delete_shop
+from lib.activity_config import ensure_activity_info_seed
+from lib.calc_coverage_tips_config import ensure_calc_coverage_tips_seed
+from lib.tips_config import ensure_tips_info_seed
 from lib.pricing_config import ensure_default_pricing_seed
+from lib.max_coverage_config import ensure_max_coverage_seed
 from lib.shipping_country_defaults import ensure_shipping_country_defaults_seed
 from lib.product_sync import sync_products_initial
 from lib.shop_profile_sync import sync_shop_profile
@@ -79,9 +82,6 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
         if ev == "SHOP_PROFILE_SYNC":
             sync_shop_profile(table, shop, token, ver)
             return
-        if ev == "ACTIVATE_APP":
-            run_activate_app_safe(table, shop, store_number, token, kms_key_id, ver)
-            return
         logger.warning("unknown_merchant_event", extra={"event": ev})
         return
 
@@ -116,11 +116,14 @@ def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
     token = decrypt_token(key_id, enc)
     ensure_default_pricing_seed(os.environ["TABLE_NAME"])
     ensure_shipping_country_defaults_seed(os.environ["TABLE_NAME"])
+    ensure_max_coverage_seed(os.environ["TABLE_NAME"])
+    ensure_activity_info_seed(os.environ["TABLE_NAME"])
+    ensure_tips_info_seed(os.environ["TABLE_NAME"])
+    ensure_calc_coverage_tips_seed(os.environ["TABLE_NAME"])
     sync_shop_profile(table, shop, token, api_version)
     meta = _shop_row(table, shop) or {}
     protection_gid = meta.get("protection_product_gid")
     sync_products_initial(table, shop, store_number, token, api_version)
-    sync_customers(table, shop, store_number, token, api_version)
     sync_orders(
         table, shop, store_number, token, api_version, protection_product_gid=protection_gid
     )
@@ -178,8 +181,6 @@ def process_webhook_envelope(
         handle_product_webhook(table, shop, store_number, token, envelope.get("body") or "", api_version)
     elif t in ("orders/create", "orders/updated"):
         handle_order_pull_webhook(table, shop, store_number, token, envelope.get("body") or "", api_version)
-    elif t in ("customers/create", "customers/update"):
-        handle_customer_pull_webhook(table, shop, store_number, token, envelope.get("body") or "", api_version)
 
 
 def handle_uninstall(table, shop: str, feishu_url: str, webhook_id: str) -> None:
@@ -360,49 +361,5 @@ def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, r
             "shopify_id": gid,
             "has_shipping_protection": has_prot,
             "sync_tags": order_sync_tags(has_prot, protection_gid),
-        }
-    )
-
-
-CUSTOMER_ONE_Q = """
-query CustOne($id: ID!) {
-  customer(id: $id) {
-    id
-    legacyResourceId
-    updatedAt
-    email
-    displayName
-  }
-}
-"""
-
-
-def handle_customer_pull_webhook(
-    table, shop: str, store_number: str, token: str, raw_body: str, api_version: str
-) -> None:
-    try:
-        body = json.loads(raw_body)
-    except json.JSONDecodeError:
-        return
-    cid = body.get("admin_graphql_api_id")
-    if not cid and body.get("id") is not None:
-        cid = f"gid://shopify/Customer/{body['id']}"
-    if not cid:
-        return
-    data = graphql_request(shop, token, CUSTOMER_ONE_Q, {"id": cid}, api_version=api_version)
-    node = data.get("data", {}).get("customer")
-    if not node:
-        return
-    pk_t = pk_tenant(store_number)
-    gid = node["id"]
-    now = datetime.now(timezone.utc).isoformat()
-    table.put_item(
-        Item={
-            "pk": pk_t,
-            "sk": f"CUSTOMER#{gid}",
-            "payload": json.dumps(node, default=str),
-            "updated_at_source": node.get("updatedAt"),
-            "synced_at": now,
-            "shopify_id": gid,
         }
     )

@@ -244,19 +244,21 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link` 等 |
-| POST | `/api/activate` | 入队异步激活（Worker 创建/更新 Shipping Protection 商品、写回 `protection_product_gid`） |
+| GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link`、`last_activation_error`（激活失败时的 JSON 字符串，成功激活后清除）等 |
+| POST | `/api/activate` | **同步**激活或再次激活：商户 Lambda 内用店铺离线 token 创建/更新 Shipping Protection 商品并写回 `protection_product_gid`。成功 **200** `{"ok":true,"activation_status":"ACTIVATED"}`；业务错误 **400**（如 `shop_profile_not_ready`、`currency_not_supported`、`pricing_not_configured`）；解密/Shopify 异常 **500/502**。激活**不会**调用 `sync_shop_profile`；`shop_currency_code` 须已由安装全量同步 / webhook / 定时对账写入 METADATA。HTTP API 与 Lambda 超时请见栈配置（商户 Lambda 已放宽以便多变体 upsert）。 |
 | PATCH | `/api/me/embed` | JSON body：`{"embed_enabled_ack": true}` |
-| POST | `/api/protection/resolve-variant` | **无 Session JWT**。同上 HMAC。Body 须含 `cart_subtotal`、`currency`（须与店铺结算货币一致）。**须已完成激活**（`activation_status=ACTIVATED`）。可选 `country`：若传入则须为全局支持国家，且会用该国 **有效最大保额（USD）** 校验购物车折算 USD 是否超限；不传 `country` 时仅用店铺级 `sp_max_coverage_usd`（或默认 9000）做上限校验。 |
-| POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`。可选 `cart_subtotal` + `currency`（须与店铺货币一致）：超过该国 **有效最大保额（USD）** → **400** `cart_exceeds_max_coverage`。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。 |
+| POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）、`shopDomain`。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`（`country` 仅用于 **费率** 等，**不参与保额**）。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。**响应** `calcInfo` 含 **`maxAmount`**、**`maxAmountCurrency`**（按店铺结算货币从全局/店铺 **按币种保额** map 解析）、`spRate` 等。 |
+| POST | `/api/shop-enabled-currencies/sync` | **Session JWT**（与 `/api/me` 相同）。从 Shopify 拉取 **店铺已启用货币** 写入 `shop_enabled_currencies_json`；**200** `{"ok":true,"currencies":[...],"synced_at":"..."}`。配置 `sp_max_coverage_by_currency` 前若尚未同步会 **400** `shop_enabled_currencies_not_synced`。 |
 
 可选环境变量（CDK 写入 Worker / 商户 Lambda，也可用 `-c` context）：`ORDER_PROTECTION_TAG`（默认 `gwofy-shipping-protection`）— 仅用于在 **本系统 DynamoDB 订单镜像** 上写入 `sync_tags`（**不会**调用 Shopify 修改商户订单）。
 
-激活时 Worker 会在商户店创建 **UNLISTED** 运费险商品，**handle** 固定为 **`GWOFY-SHIPPING-PROTECTION-QAQWER`**，变体 **Plan = S0001…S0098**，每变体 **SKU = `plan_code`**。全局 **`PUT /admin/config/pricing-model`** 的 `tiers` 每条仅需 **`plan_code`**（可与 **`sku` 二选一作为别名，二者不得冲突）、**`price_usd`**；不写购物车区间——按 **数组顺序** 将「有效最大保额（USD）」均分为 `len(tiers)` 段并映射档位。**禁止删除** Dynamo 里曾出现过的 `plan_code`（仅可加档或改价）。仍含 **`min_usd`** 的旧数据走兼容解析。首装缺省会种子 **98 档**。
+激活时在商户店创建/更新 **UNLISTED** 运费险商品，**handle** 固定为 **`GWOFY-SHIPPING-PROTECTION-QAQWER`**，变体 **Plan = S0001…S0098**，每变体 **SKU = `plan_code`**。变体**标价**为管理员在该店铺**结算货币**下配置的 **原生金额**（字段 **`price`**，兼容读取旧数据中的 **`price_usd`**）；**激活不再使用汇率**。档位与购物车 subtotal 的映射仍按 **数组顺序** 将「有效最大保额」在 **USD 分量**（`effective_max_coverage_usd` / 合并 map 的 `USD`）上均分为 `len(tiers)` 段（由客户端在本地用购物车金额完成档位换算）。激活成功后会 **REMOVE** 历史上可能存在的 `last_fx_*` 字段。**禁止删除** Dynamo 里曾出现过的 `plan_code`（仅可加档或改价）。仍含 **`min_usd`** 的旧数据走兼容解析。首装缺省由 Worker 种子 **`PRICING_MODEL#USD`** + **`SUPPORTED_CURRENCIES`**（默认仅 `USD`）、**`MAX_COVERAGE_BY_CURRENCY`**（默认 `{"USD":9000}`）、`SHIPPING_COUNTRY_DEFAULTS`（各国仅 `rate`）；若仍存在旧版 **`PRICING_MODEL_DEFAULT`** 行则迁移到 USD 定价行。
 
-**全局支持国家**（`GLOBAL#CONFIG` / `SHIPPING_COUNTRY_DEFAULTS`）：`GET/PUT /admin/config/shipping-countries`，body 示例：`{"countries":{"US":{"rate":"0.04","max_coverage_usd":9000},"CA":{"rate":"0.05","max_coverage_usd":8000}}}`。未出现在该对象中的国家 **不支持**，无需配置费率/保额。Worker 首次同步会 **种子** 一批常见国家；可整体替换。`shop/update` 与 **markets** webhook 仅对 **支持列表内的国家** 在 `sp_market_rates_json` 中自动写入 **全局配置里该国的默认 `rate`**（不在支持列表的国家不会写入店铺费率）。
+**全局支持国家**（`GLOBAL#CONFIG` / `SHIPPING_COUNTRY_DEFAULTS`）：`GET/PUT /admin/config/shipping-countries`，body 示例：`{"countries":{"US":{"rate":"0.04"},"CA":{"rate":"0.05"}}}`（**每国仅 `rate`**；不再按国存保额）。未出现在该对象中的国家 **不支持**。Worker 首次同步会 **种子** 一批常见国家；可整体替换。`shop/update` 与 **markets** webhook 仅对 **支持列表内的国家** 在 `sp_market_rates_json` 中自动写入 **全局配置里该国的默认 `rate`**。
 
-**店铺覆盖**：`PUT /admin/shops/{shop}/shipping-calc-settings` 可更新 `sp_market_rates`（某国 **特殊费率**，覆盖全局默认）、`sp_max_coverage_usd`（全店兜底保额）、`sp_country_max_overrides`（按国覆盖最大保额，如 `{"US":12000}`）。**有效费率** = 店铺该国费率（若有）否则全局该国 `rate`；**有效最大保额（USD）** = 店铺 `sp_country_max_overrides` 该国值 → 否则全局该国 `max_coverage_usd` → 否则 `sp_max_coverage_usd` → 否则 9000。Partner 需 **`read_markets`**（见 `shopify.app.toml`）。
+**全局保额（按币种，不按国）**：`GLOBAL#CONFIG` / **`MAX_COVERAGE_BY_CURRENCY`**。`GET/PUT /admin/config/max-coverage-by-currency`，body：`{"amounts":{"USD":9000,"EUR":8200}}`（键须为管理员允许列表中的 ISO 4217）。
+
+**店铺覆盖**：`PUT /admin/shops/{shop}/shipping-calc-settings` 可更新 `sp_market_rates`（按国 **费率**）、`sp_max_coverage_usd`（legacy 全店 USD 兜底）、**`sp_max_coverage_by_currency`**（按 **币种** 覆盖保额，与全局 merge；键须为 **店铺已启用货币 ∩ 平台允许**）。**`sp_country_max_overrides` 已废弃**（**400** `deprecated_sp_country_max_overrides`）。写入 `sp_max_coverage_by_currency` 前须先 **`POST /api/shop-enabled-currencies/sync`** 或 **`POST /admin/shops/{shop}/sync-enabled-currencies`**（否则 **400** `shop_enabled_currencies_not_synced`）。**有效费率** = 店铺该国 `sp_market_rates`（若有）否则全局该国 `rate`。**有效保额** = 全局 `amounts` 与店铺 `sp_max_coverage_by_currency_json` 按币种 merge 后，取 **`shop_currency_code`** 对应金额（无则 `USD`，再无则 `sp_max_coverage_usd`，最后 9000）。OAuth / `INITIAL_SYNC` / `sync_shop_profile` 会拉取 **店铺启用货币** 列表。Partner 需 **`read_markets`**；读取 `currencySettings` 建议含 **`read_shop`**（见 `shopify.app.toml`）。
 
 ### 管理员（Cognito JWT + 用户组）
 
@@ -267,17 +269,30 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 - **Cognito Hosted UI 回调**：`GET /auth/callback`（**无需** JWT）。浏览器从 Cognito **`/oauth2/authorize`** 授权后带 `?code=` 重定向至此；Lambda 向 Cognito **`/oauth2/token`** 换 token，默认返回 **HTML**（可复制 **Id token** 用于 `Authorization: Bearer`）；请求头 **`Accept: application/json`** 时返回 JSON。**回调 URL** 由 **`WEBHOOK_BASE_URL` + `/auth/callback`** 组成（须与 Cognito App Client 里配置的 Allowed callback URLs **完全一致**）。部署前还需设置 **`COGNITO_HOSTED_UI_DOMAIN`**（或 `-c cognito_hosted_ui_domain=`），值为 Cognito **域名前缀主机名**，例如 **`ap-east-1xxxx.auth.ap-east-1.amazoncognito.com`**（不要带 `https://`）。
 - 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience = `AdminCognitoUserPoolClientId`）：
   - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）
-  - `GET /admin/shops/{shop}`（`shop` 需 URL 编码）
+  - `GET /admin/shops/{shop}`（`shop` 需 URL 编码；`shop` 对象内含 **`shop_enabled_currencies`** 解析数组，便于配置保额 UI）
   - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
   - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
   - `GET /admin/shops/{shop}/audit`（审计流水）
-  - `GET /admin/config/pricing-model` → `{"tiers":[...]}`（与 `PUT` 体中 `tiers` 同形；无表内数据时返回代码内默认 98 档种子）
-  - `PUT /admin/config/pricing-model`，body：`{"tiers":[...]}`（1–200 条；每条 **`plan_code`** + **`price_usd`**；可选 **`sku`** 仅作 `plan_code` 别名；**`plan_code` 唯一**；不可删掉历史上已有的档位编码）
-  - `GET /admin/config/shipping-countries`、`PUT /admin/config/shipping-countries`，body：`{"countries":{...}}`（每国 `rate` + `max_coverage_usd`；允许空对象表示暂不支持任何国家）
-  - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、`sp_country_max_overrides`
+  - `GET /admin/config/supported-currencies` → `{"currencies":["USD","EUR",...]}`（管理员启用的币种，须为代码内允许列表的子集）
+  - `PUT /admin/config/supported-currencies`，body：`{"currencies":["USD","EUR"]}`（非空、去重、大写存储）
+  - `GET /admin/config/pricing-model/{currency}` → `{"currency":"USD","tiers":[...]}`（与 `PUT` 体中 `tiers` 同形；**USD** 无表内数据时 `tiers` 为代码内默认 98 档）
+  - `PUT /admin/config/pricing-model/{currency}`，body：`{"tiers":[...]}`（1–200 条；每条 **`plan_code`** + **`price`**（原生标价）；兼容 **`price_usd`** 作为数值来源；可选 **`sku`** 仅作 `plan_code` 别名；**`plan_code` 唯一**；不可删掉历史上已有的档位编码；`{currency}` 须为 **允许列表** 中的 ISO 4217）
+  - `GET /admin/config/pricing-model` → 与 **`GET .../pricing-model/USD`** 等价（兼容旧客户端）
+  - `PUT /admin/config/pricing-model` → **400** `deprecated_use_pricing_model_currency`，请改用带币种路径的 `PUT`
+  - `GET /admin/config/shipping-countries`、`PUT /admin/config/shipping-countries`，body：`{"countries":{...}}`（每国仅 **`rate`**；允许空对象表示暂不支持任何国家）
+  - `GET /admin/config/max-coverage-by-currency` → `{"amounts":{"USD":9000,...}}`；`PUT /admin/config/max-coverage-by-currency`，body：`{"amounts":{...}}`（全局按 **币种** 的保额默认）
+  - `GET /admin/config/activity-info`、`PUT /admin/config/activity-info`，body：`{"activityExtInfo":"<字符串>","activityState":<整数>}` — 与 **`POST /api/cart-config`** 返回里 `dataInfo.activityInfo` 同源（购物车活动占位；商户侧仅一条运费险 Shopify 商品，**运费险 / 退货险开关**见各店 `shipping_protection_status` / `return_insurance_status`，不由多件商品区分）
+  - `GET /admin/config/tips-info`、`PUT /admin/config/tips-info`，body：`{"ppVersion":{"faqUrl":"","locationType":"","popup":"","terms":""},"spVersion":{"faqUrl":"","popup":"","terms":""}}` — 与 **`POST /api/cart-config`** 返回里 `tipsInfo` 同源（PP / SP 文案区 FAQ、条款链接、`popup` 等）
+  - `GET /admin/config/calc-coverage-tips`、`PUT /admin/config/calc-coverage-tips`，body：`{"spBelowMinCoverageTip":"<字符串>","spGreaterMaxCoverageTip":"<字符串>"}` — **全局**购物车 **`calcInfo`** 保额提示文案（默认空串）
+  - `GET /admin/shops/{shop}/calc-coverage-tips` → `global`、`shopOverride`（店铺是否覆盖）、`effective`（店铺请求 **`/api/cart-config`** 时实际下发）
+  - `PUT /admin/shops/{shop}/calc-coverage-tips`，body 可只含其一或两项：`spBelowMinCoverageTip`、`spGreaterMaxCoverageTip`；值为 **`null`** 表示删除该字段覆盖并回退全局 — 与 **`POST /api/cart-config`** 里 **`calcInfo.spBelowMinCoverageTip` / `spGreaterMaxCoverageTip`** 同源（**已移除** `calcInfo` 中的 `spMaxCoverage`、`spMinCoverage`、`zeroBuyConf`，保额上限仍以 **`maxAmount`** 表示）
+  - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、**`sp_max_coverage_by_currency`**（不再接受 `sp_country_max_overrides`）
+  - `POST /admin/shops/{shop}/sync-enabled-currencies` — 用店铺离线 token 拉取 Shopify 启用货币列表（与商户 **`POST /api/shop-enabled-currencies/sync`** 同源逻辑）
 
-定价 / 变体模板 / 支持国家缺省时 Worker 会种子写入 `GLOBAL#CONFIG` 下 `PRICING_MODEL_DEFAULT`（默认 98 档）与 `SHIPPING_COUNTRY_DEFAULTS`。DynamoDB 表含 **GSI2**（`SHOP_INDEX`）用于列举店铺。
+定价 / 变体模板 / 支持国家（仅 rate）/ **按币种全局保额** `MAX_COVERAGE_BY_CURRENCY` / **activityInfo** / **tipsInfo** / **calc-coverage-tips（全局）** 缺省时 Worker 会种子写入 `GLOBAL#CONFIG` 下 **`PRICING_MODEL#USD`**（默认 98 档）、**`SUPPORTED_CURRENCIES`**（默认 `["USD"]`）、**`MAX_COVERAGE_BY_CURRENCY`**（默认 `USD:9000`）、`SHIPPING_COUNTRY_DEFAULTS`（各国仅 `rate`）、**`ACTIVITY_INFO`**、**`TIPS_INFO`** 与 **`CALC_COVERAGE_TIPS`**（默认可为空文案）。旧版 **`PRICING_MODEL_DEFAULT`** 若存在则迁移到 **`PRICING_MODEL#USD`**。**店铺级**提示写在对应店铺 **`METADATA`** 的 `sp_below_min_coverage_tip` / `sp_greater_max_coverage_tip`。DynamoDB 表含 **GSI2**（`SHOP_INDEX`）用于列举店铺。
+
+**迁移说明**：若 Dynamo 中 `SHIPPING_COUNTRY_DEFAULTS` 仍含各国 **`max_coverage_usd`**，新代码**不再读取**该字段作为保额；请用 **`PUT /admin/config/max-coverage-by-currency`** 与店铺 **`sp_max_coverage_by_currency`** 表达保额。历史 **`sp_country_max_overrides`** 仅保留在 METADATA 中不再生效；请改用按币种 map 并调用启用货币同步后再写店铺覆盖。
 
 ---
 

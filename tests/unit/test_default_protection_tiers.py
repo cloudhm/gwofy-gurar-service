@@ -17,8 +17,8 @@ def test_build_default_tiers_count_and_shape():
     assert len(tiers) == 98
     assert tiers[0]["plan_code"] == "S0001"
     assert tiers[-1]["plan_code"] == "S0098"
-    assert float(tiers[0]["price_usd"]) == 0.98
-    assert float(tiers[-1]["price_usd"]) == 359.0
+    assert float(tiers[0]["price"]) == 0.98
+    assert float(tiers[-1]["price"]) == 359.0
     assert "min_usd" not in tiers[0]
     assert "sku" not in tiers[0]
 

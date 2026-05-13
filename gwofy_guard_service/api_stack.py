@@ -288,7 +288,7 @@ class ApiStack(Stack):
             runtime=aws_lambda.Runtime.PYTHON_3_12,
             handler="merchant_api_handler.handler",
             code=code,
-            timeout=Duration.seconds(29),
+            timeout=Duration.seconds(120),
             memory_size=512,
             environment={
                 **common_env,
@@ -311,10 +311,7 @@ class ApiStack(Stack):
             code=code,
             timeout=Duration.seconds(29),
             memory_size=512,
-            environment={
-                "TABLE_NAME": table.table_name,
-                "ADMIN_COGNITO_GROUP": admin_group_name,
-            },
+            environment={**common_env, "ADMIN_COGNITO_GROUP": admin_group_name},
             log_group=_week_log_group(self, "AdminApiFnLogGroup"),
         )
 
@@ -343,6 +340,7 @@ class ApiStack(Stack):
         token_key.grant_encrypt_decrypt(oauth_fn)
         token_key.grant_decrypt(worker_fn)
         token_key.grant_decrypt(merchant_fn)
+        token_key.grant_decrypt(admin_fn)
 
         work_queue.grant_send_messages(oauth_fn)
         work_queue.grant_send_messages(reconcile_fn)
@@ -418,12 +416,12 @@ class ApiStack(Stack):
             integration=merchant_integ,
         )
         http_api.add_routes(
-            path="/api/protection/resolve-variant",
+            path="/api/cart-config",
             methods=[apigwv2.HttpMethod.POST],
             integration=merchant_integ,
         )
         http_api.add_routes(
-            path="/api/cart-config",
+            path="/api/shop-enabled-currencies/sync",
             methods=[apigwv2.HttpMethod.POST],
             integration=merchant_integ,
         )

@@ -1,4 +1,4 @@
-"""Merchant Session API: /api/me, activate, embed ack, protection variant resolve."""
+"""Merchant Session API: /api/me, activate, embed ack, storefront cart-config (HMAC)."""
 
 from __future__ import annotations
 
@@ -6,24 +6,19 @@ import base64
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 import boto3
 
+from lib.activate_app import ActivateAppError, run_activate_app_safe
 from lib.audit import append_audit
 from lib.cart_config_response import build_cart_plugin_response
-from lib.shipping_country_defaults import (
-    effective_max_coverage_usd,
-    is_country_supported,
-)
 from lib.kms_tokens import decrypt_token
+from lib.shipping_country_defaults import is_country_supported
 from lib.logging_json import setup_logging
 from lib.models import SK_METADATA, pk_shop
-from lib.pricing_config import get_pricing_model
-from lib.pricing_resolve import pick_tier, shop_to_usd
 from lib.session_jwt import shop_host_from_payload, verify_session_token
+from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
-from lib.variant_lookup import variant_gid_for_plan
 
 logger = setup_logging("merchant_api")
 
@@ -55,9 +50,6 @@ def handler(event, context):
     if method == "POST" and path == "/api/cart-config":
         return _cart_config(event, table, req_id)
 
-    if method == "POST" and path == "/api/protection/resolve-variant":
-        return _resolve_variant(event, table, req_id)
-
     auth = headers.get("authorization") or ""
     if not auth.startswith("Bearer "):
         return _resp(401, {"error": "missing_bearer"})
@@ -81,6 +73,8 @@ def handler(event, context):
         return _activate(table, shop_host, payload, headers, req_id)
     if method == "PATCH" and path == "/api/me/embed":
         return _embed_ack(event, table, shop_host, payload, headers, req_id)
+    if method == "POST" and path == "/api/shop-enabled-currencies/sync":
+        return _sync_shop_currencies(table, shop_host, payload, headers, req_id)
 
     return _resp(404, {"error": "not_found"})
 
@@ -126,6 +120,9 @@ def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
         "updated_at": item.get("updated_at"),
         "last_fx_usd_to_shop": item.get("last_fx_usd_to_shop"),
         "last_fx_as_of": item.get("last_fx_as_of"),
+        "last_activation_error": item.get("last_activation_error"),
+        "shop_enabled_currencies": sorted(parse_shop_enabled_currencies_json(item)),
+        "shop_enabled_currencies_synced_at": item.get("shop_enabled_currencies_synced_at"),
     }
 
     _maybe_enqueue_profile_refresh(table, shop_host, item)
@@ -186,22 +183,47 @@ def _activate(table, shop_host: str, payload: dict, headers: dict, req_id: str):
         source_ip=_xff(headers),
     )
 
-    q = os.environ["WORK_QUEUE_URL"]
+    enc = item.get("access_token_enc")
+    if not enc:
+        return _resp(400, {"error": "missing_access_token"})
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    key_id = str(item.get("kms_key_id") or kms_key_id)
+    try:
+        shop_token = decrypt_token(key_id, str(enc))
+    except Exception as e:
+        logger.exception("activate_token_decrypt_failed", extra={"shop": shop_host})
+        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
+
     api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-    sqs.send_message(
-        QueueUrl=q,
-        MessageBody=json.dumps(
-            {
-                "source": "merchant_api",
-                "event": "ACTIVATE_APP",
-                "shop": shop_host,
-                "store_number": str(item.get("store_number", "")),
-                "api_version": api_version,
-                "actor_sub": str(payload.get("sub") or ""),
-            }
-        ),
+    actor_sub = str(payload.get("sub") or "")
+    try:
+        run_activate_app_safe(
+            table,
+            shop_host,
+            str(item.get("store_number", "")),
+            shop_token,
+            kms_key_id,
+            api_version,
+            actor_sub=actor_sub,
+        )
+    except ActivateAppError as e:
+        body: dict = {"error": e.code, "message": e.message}
+        if e.currency:
+            body["currency"] = e.currency
+        if e.supported is not None:
+            body["supported"] = e.supported
+        return _resp(400, body)
+    except Exception as e:
+        logger.exception("activate_failed", extra={"shop": shop_host})
+        return _resp(
+            502,
+            {"error": "activate_upstream_failed", "detail": str(e)[:500]},
+        )
+
+    return _resp(
+        200,
+        {"ok": True, "activation_status": "ACTIVATED"},
     )
-    return _resp(202, {"ok": True, "queued": True})
 
 
 def _embed_ack(event, table, shop_host: str, payload: dict, headers: dict, req_id: str):
@@ -231,6 +253,48 @@ def _embed_ack(event, table, shop_host: str, payload: dict, headers: dict, req_i
         source_ip=_xff(headers),
     )
     return _resp(200, {"ok": True})
+
+
+def _sync_shop_currencies(table, shop_host: str, payload: dict, headers: dict, req_id: str):
+    item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    if not item:
+        return _resp(404, {"error": "shop_not_installed"})
+    if item.get("installation_status") != "ACTIVE":
+        return _resp(400, {"error": "shop_not_active"})
+    if item.get("plugin_suspended"):
+        return _resp(403, {"error": "plugin_suspended"})
+    enc = item.get("access_token_enc")
+    if not enc:
+        return _resp(400, {"error": "missing_access_token"})
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    key_id = str(item.get("kms_key_id") or kms_key_id)
+    try:
+        shop_token = decrypt_token(key_id, str(enc))
+    except Exception as e:
+        logger.exception("sync_currencies_token_decrypt_failed", extra={"shop": shop_host})
+        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
+    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+    fb = str(item.get("shop_currency_code") or "").strip().upper()
+    try:
+        codes = sync_shop_enabled_currencies(
+            table, shop_host, shop_token, api_version, fallback_primary=fb or None
+        )
+    except Exception as e:
+        return _resp(502, {"error": "sync_shop_currencies_failed", "detail": str(e)[:500]})
+    now = datetime.now(timezone.utc).isoformat()
+    append_audit(
+        table,
+        shop_host,
+        actor_type="merchant",
+        actor_id=str(payload.get("sub") or ""),
+        action="SHOP_ENABLED_CURRENCIES_SYNC",
+        outcome="ok",
+        http_path="/api/shop-enabled-currencies/sync",
+        request_id=req_id,
+        source_ip=_xff(headers),
+        detail={"count": len(codes), "synced_at": now},
+    )
+    return _resp(200, {"ok": True, "currencies": codes, "synced_at": now})
 
 
 def _cart_config(event, table, req_id: str):
@@ -268,40 +332,13 @@ def _cart_config(event, table, req_id: str):
     if not is_country_supported(table, country_cc):
         return _resp(400, {"error": "country_not_supported", "country": country_cc})
 
-    total = body.get("cart_subtotal")
-    if total is not None:
-        cur = str(body.get("currency") or "").strip().upper()
-        shop_ccy = str(item.get("shop_currency_code") or "").upper()
-        if not cur or cur != shop_ccy:
-            return _resp(400, {"error": "currency_mismatch", "expected": shop_ccy})
-        rate_s = item.get("last_fx_usd_to_shop")
-        if not rate_s:
-            return _resp(400, {"error": "fx_missing_activate_first"})
-        rate = float(rate_s)
-        cart_shop = Decimal(str(total))
-        cart_usd = shop_to_usd(cart_shop, rate)
-        max_usd = float(effective_max_coverage_usd(table, item, country_cc))
-        if cart_usd > Decimal(str(max_usd)):
-            return _resp(
-                400,
-                {
-                    "error": "cart_exceeds_max_coverage",
-                    "max_coverage_usd": max_usd,
-                    "cart_subtotal_usd": str(cart_usd),
-                },
-            )
-
     country = str(body.get("country") or "")
-    currency = str(body.get("currency") or "")
-    language = str(body.get("language") or "en")
     dbg = str(body.get("debugParam") or "").lower() in ("1", "true", "yes")
 
     payload = build_cart_plugin_response(
         table,
         item,
         country=country,
-        currency=currency,
-        language=language,
         debug_mode=dbg,
     )
     append_audit(
@@ -316,107 +353,6 @@ def _cart_config(event, table, req_id: str):
         source_ip=_xff(headers),
     )
     return _resp(200, payload)
-
-
-def _resolve_variant(event, table, req_id: str):
-    headers = _headers(event)
-    shop = (headers.get("x-gwofy-shop") or "").strip().lower().rstrip("/")
-    sig = headers.get("x-gwofy-signature") or ""
-    secret = os.environ["SHOPIFY_CLIENT_SECRET"]
-    raw = event.get("body") or ""
-    if event.get("isBase64Encoded"):
-        raw = base64.b64decode(raw).decode("utf-8", errors="replace")
-    if not shop or not verify_shop_body_hmac(secret, shop, raw, sig):
-        return _resp(401, {"error": "invalid_hmac"})
-
-    try:
-        body = json.loads(raw) if isinstance(raw, str) else {}
-    except json.JSONDecodeError:
-        return _resp(400, {"error": "invalid_json"})
-
-    total = body.get("cart_subtotal")
-    currency = (body.get("currency") or "").strip().upper()
-    if total is None or not currency:
-        return _resp(400, {"error": "cart_subtotal_and_currency_required"})
-
-    item = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
-    if not item or item.get("installation_status") != "ACTIVE":
-        return _resp(404, {"error": "shop_not_installed"})
-    if item.get("plugin_suspended"):
-        return _resp(403, {"error": "plugin_suspended"})
-    if str(item.get("activation_status") or "") != "ACTIVATED":
-        return _resp(403, {"error": "shop_not_activated", "hint": "Complete activation before resolving a variant."})
-    pid = item.get("protection_product_gid")
-    if not pid:
-        return _resp(400, {"error": "protection_product_missing_activate_first"})
-
-    shop_ccy = str(item.get("shop_currency_code") or "").upper()
-    if currency != shop_ccy:
-        return _resp(400, {"error": "currency_mismatch", "expected": shop_ccy})
-
-    rate_s = item.get("last_fx_usd_to_shop")
-    if not rate_s:
-        return _resp(400, {"error": "fx_missing_activate_first"})
-    rate = float(rate_s)
-    cart_shop = Decimal(str(total))
-    cart_usd = shop_to_usd(cart_shop, rate)
-
-    country_opt = str(body.get("country") or "").strip().upper()
-    if country_opt:
-        if not is_country_supported(table, country_opt):
-            return _resp(400, {"error": "country_not_supported", "country": country_opt})
-        coverage_max = float(effective_max_coverage_usd(table, item, country_opt))
-    else:
-        coverage_max = float(item.get("sp_max_coverage_usd") or 9000)
-
-    if cart_usd > Decimal(str(coverage_max)):
-        return _resp(
-            400,
-            {
-                "error": "cart_exceeds_max_coverage",
-                "max_coverage_usd": coverage_max,
-                "cart_subtotal_usd": str(cart_usd),
-            },
-        )
-
-    tier = pick_tier(get_pricing_model(table), cart_usd, coverage_max_usd=coverage_max)
-    if not tier:
-        return _resp(404, {"error": "no_tier"})
-
-    plan_code = str(tier.get("plan_code") or tier.get("sku") or "")
-    enc = item.get("access_token_enc")
-    if not enc:
-        return _resp(500, {"error": "no_token"})
-    kms_key = item.get("kms_key_id") or os.environ["KMS_KEY_ID"]
-    access = decrypt_token(kms_key, enc)
-    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-    vid = variant_gid_for_plan(shop, access, api_version, str(pid), plan_code)
-    if not vid:
-        return _resp(404, {"error": "variant_not_found", "plan_code": plan_code})
-
-    price_shop = (Decimal(str(tier.get("price_usd", 0))) * Decimal(str(rate))).quantize(Decimal("0.01"))
-
-    append_audit(
-        table,
-        shop,
-        actor_type="merchant",
-        actor_id="storefront_hmac",
-        action="PROTECTION_RESOLVE",
-        outcome="ok",
-        detail={"plan_code": plan_code, "variant_gid_prefix": vid[:40]},
-        http_path="/api/protection/resolve-variant",
-        request_id=req_id,
-        source_ip=_xff(headers),
-    )
-    return _resp(
-        200,
-        {
-            "variant_id": vid,
-            "plan_code": plan_code,
-            "price": str(price_shop),
-            "currency": currency,
-        },
-    )
 
 
 def _resp(code: int, body: dict):

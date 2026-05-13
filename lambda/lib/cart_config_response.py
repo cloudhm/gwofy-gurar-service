@@ -6,9 +6,13 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
+from .activity_config import get_activity_info
+from .calc_coverage_tips_config import effective_calc_coverage_tips
+from .tips_config import get_tips_info
 from .default_protection_tiers import PROTECTION_PRODUCT_HANDLE
-from .pricing_config import get_pricing_model
-from .shipping_country_defaults import effective_max_coverage_usd, effective_rate
+from .pricing_config import get_pricing_model, get_supported_currencies
+from .max_coverage_config import effective_max_coverage_for_cart
+from .shipping_country_defaults import effective_rate
 
 
 def stable_shop_plugin_id(store_number: str) -> int:
@@ -25,18 +29,18 @@ def build_cart_plugin_response(
     meta: dict[str, Any],
     *,
     country: str,
-    currency: str,
-    language: str,
     debug_mode: bool = False,
 ) -> dict[str, Any]:
-    """Shape aligned with legacy Xcotton-style cart plugin; extend via admin/Dynamo later."""
+    """Shape aligned with legacy Gwofy-style cart plugin; extend via admin/Dynamo later."""
     sp_st = str(meta.get("shipping_protection_status") or "CLOSED")
     ri_st = str(meta.get("return_insurance_status") or "CLOSED")
     sp_open = sp_st.startswith("OPEN")
     ri_open = ri_st.startswith("OPEN")
 
     cc = (country or "").strip().upper()
-    max_cov = float(effective_max_coverage_usd(table, meta, cc))
+    shop_ccy = str(meta.get("shop_currency_code") or "").strip().upper()
+    max_cov, max_cov_ccy = effective_max_coverage_for_cart(table, meta, shop_ccy or None)
+    max_cov = float(max_cov)
     rate_s = effective_rate(table, meta, cc)
     try:
         rate_f = float(rate_s)
@@ -44,11 +48,23 @@ def build_cart_plugin_response(
         rate_f = 0.04
         rate_s = "0.04"
 
-    tiers = get_pricing_model(table)
+    tiers = get_pricing_model(table, shop_ccy) if shop_ccy else []
+    if not tiers:
+        tiers = [{"plan_code": "S0001", "price": 0.98}]
     first = tiers[0] if tiers else {}
     sp_sku = str(first.get("plan_code") or first.get("sku") or "S0001")
     sn = str(meta.get("store_number") or "")
     pub = str(meta.get("updated_at") or datetime.now(timezone.utc).isoformat())
+
+    # Single Shopify protection product; SP vs PP in `auth` are feature flags only.
+    protection_product = {
+        "handle": PROTECTION_PRODUCT_HANDLE,
+        "publishAt": pub,
+        "sku": sp_sku,
+    }
+    activity = get_activity_info(table)
+    tips = get_tips_info(table)
+    calc_tips = effective_calc_coverage_tips(table, meta)
 
     return {
         "auth": {
@@ -67,35 +83,16 @@ def build_cart_plugin_response(
             "calcDebugVersion": "",
         },
         "dataInfo": {
-            "activityInfo": {"activityExtInfo": "", "activityState": 0},
+            "activityInfo": activity,
             "productInfo": {
-                "ppProduct": {
-                    "handle": "product-protection",
-                    "publishAt": pub,
-                    "sku": "XMHPPSKU",
-                },
-                "spProduct": {
-                    "handle": PROTECTION_PRODUCT_HANDLE,
-                    "publishAt": pub,
-                    "sku": sp_sku,
-                },
+                "protectionProduct": dict(protection_product),
+                "spProduct": dict(protection_product),
+                "ppProduct": dict(protection_product),
             },
             "shop": {"shopId": stable_shop_plugin_id(sn)},
         },
-        "tipsInfo": {
-            "ppVersion": {
-                "faqUrl": "https://gwofy.com/docs/pp-faq",
-                "locationType": "normal",
-                "popup": "gwofy",
-                "terms": "https://gwofy.com/terms/pp",
-            },
-            "spVersion": {
-                "faqUrl": "https://gwofy.com/docs/sp-faq",
-                "popup": "SP-GWOFY",
-                "terms": "https://gwofy.com/terms/sp",
-            },
-        },
-        "xmhSupportCurrency": ["USD", "CAD", "EUR", "GBP", "AUD", "JPY"],
+        "tipsInfo": tips,
+        "xmhSupportCurrency": get_supported_currencies(table),
         "xmhSupportLocale": [
             {
                 "languageISO": "en",
@@ -113,25 +110,12 @@ def build_cart_plugin_response(
         "calcInfo": {
             "calcScope": "client",
             "maxAmount": max_cov,
+            "maxAmountCurrency": max_cov_ccy,
             "originRate": "",
             "reportUrl": "",
-            "spBelowMinCoverageTip": "",
-            "spGreaterMaxCoverageTip": "",
-            "spMaxCoverage": max_cov,
-            "spMinCoverage": 0,
+            "spBelowMinCoverageTip": calc_tips["spBelowMinCoverageTip"],
+            "spGreaterMaxCoverageTip": calc_tips["spGreaterMaxCoverageTip"],
             "spRate": rate_s,
-            "zeroBuyConf": {
-                "enable": False,
-                "enableActivity": False,
-                "enableContainsMatch": False,
-                "enableInsure": False,
-                "ignoreCoverageLimit": False,
-                "itemFilterRules": None,
-                "lowPriceInt": 0,
-                "orderFilterRules": None,
-                "rate": "",
-                "skipInsuredMail": False,
-            },
         },
         "configuration": {
             "calcVersion": "v1-0-3",
@@ -156,7 +140,7 @@ def build_cart_plugin_response(
             "ppConfig": {"dialogConfig": {"dialogVersion": "3.0"}},
             "spMode": "checkoutPlus",
             "spLocale": {
-                (language or "en"): {
+                "en": {
                     "mainCartTitle": "<p>Shipping Protection</p>",
                     "coverBtnText": "Cover My Order Now",
                 }

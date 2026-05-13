@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 from .markets_sync import sync_market_rates_after_profile
 from .models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
+from .shop_enabled_currencies import sync_shop_enabled_currencies
 from .shopify_api import graphql_request
 
 SHOP_QUERY = """
@@ -23,6 +24,14 @@ query ShopProfile {
     billingAddress { countryCodeV2 }
     plan { displayName shopifyPlus }
     primaryDomain { host }
+    currencySettings(first: 50) {
+      edges {
+        node {
+          currencyCode
+          enabled
+        }
+      }
+    }
   }
 }
 """
@@ -112,6 +121,17 @@ def sync_shop_profile(
         )
     except Exception:
         logger.warning("market_rates_sync_skipped", exc_info=True)
+
+    try:
+        sync_shop_enabled_currencies(
+            table,
+            shop_norm,
+            token,
+            api_version,
+            fallback_primary=str(s.get("currencyCode") or ""),
+        )
+    except Exception:
+        logger.warning("shop_enabled_currencies_sync_skipped", exc_info=True)
 
     return {
         "shop_currency_code": expr_vals[":cur"],

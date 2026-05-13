@@ -88,6 +88,8 @@ def handler(event, context):
         "return_insurance_status",
         "shipping_protection_status",
         "plugin_suspended",
+        "sp_below_min_coverage_tip",
+        "sp_greater_max_coverage_tip",
     ):
         if prev.get(k) is not None:
             item[k] = prev[k]
@@ -103,8 +105,6 @@ def handler(event, context):
             "products/update",
             "orders/create",
             "orders/updated",
-            "customers/create",
-            "customers/update",
             "customers/data_request",
             "customers/redact",
             "shop/redact",

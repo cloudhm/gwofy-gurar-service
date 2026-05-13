@@ -16,8 +16,38 @@ from boto3.dynamodb.conditions import Attr
 from lib.admin_cognito import admin_in_required_group, cognito_groups_from_claims
 from lib.audit import append_audit
 from lib.logging_json import setup_logging
-from lib.models import GSI2_PK_SHOP_INDEX, SK_AUDIT_PREFIX, SK_METADATA, pk_shop, pk_tenant
-from lib.pricing_config import get_pricing_model, put_pricing_model
+from lib.calc_coverage_tips_config import (
+    effective_calc_coverage_tips,
+    get_calc_coverage_tips_global,
+    put_calc_coverage_tips_global,
+    shop_override_snapshot,
+    validate_shop_tip_value,
+)
+from lib.models import (
+    GSI2_PK_SHOP_INDEX,
+    META_SP_BELOW_MIN_COVERAGE_TIP,
+    META_SP_GREATER_MAX_COVERAGE_TIP,
+    SK_AUDIT_PREFIX,
+    SK_METADATA,
+    pk_shop,
+    pk_tenant,
+)
+from lib.activity_config import get_activity_info, put_activity_info
+from lib.tips_config import get_tips_info, put_tips_info
+from lib.pricing_config import (
+    get_pricing_model,
+    get_supported_currencies,
+    put_pricing_model,
+    put_supported_currencies,
+)
+from lib.max_coverage_config import (
+    get_global_max_coverage_by_currency,
+    normalize_shop_max_coverage_for_storage,
+    put_global_max_coverage_by_currency,
+    validate_shop_max_coverage_by_currency,
+)
+from lib.kms_tokens import decrypt_token
+from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
 
 logger = setup_logging("admin")
@@ -66,16 +96,59 @@ def handler(event, context):
 
     table = ddb.Table(os.environ["TABLE_NAME"])
 
+    cfg_parts = path.strip("/").split("/")
+    if len(cfg_parts) >= 3 and cfg_parts[0] == "admin" and cfg_parts[1] == "config":
+        if cfg_parts[2] == "supported-currencies":
+            if method == "GET":
+                return _resp(200, {"currencies": get_supported_currencies(table)})
+            if method == "PUT":
+                return _put_supported_currencies(event, table, actor_sub, actor_email, req_id)
+        if len(cfg_parts) == 4 and cfg_parts[2] == "pricing-model":
+            ccy = unquote(cfg_parts[3]).strip().upper()
+            if method == "GET":
+                return _resp(200, {"currency": ccy, "tiers": get_pricing_model(table, ccy)})
+            if method == "PUT":
+                return _put_pricing_currency(event, table, ccy, actor_sub, actor_email, req_id)
+
     if method == "GET" and path == "/admin/config/pricing-model":
-        return _resp(200, {"tiers": get_pricing_model(table)})
+        return _resp(200, {"tiers": get_pricing_model(table, "USD")})
 
     if method == "PUT" and path == "/admin/config/pricing-model":
-        return _put_pricing(event, table, actor_sub, actor_email, req_id)
+        return _resp(
+            400,
+            {
+                "error": "deprecated_use_pricing_model_currency",
+                "hint": "PUT /admin/config/pricing-model/USD (or other ISO currency code)",
+            },
+        )
 
     if method == "GET" and path == "/admin/config/shipping-countries":
         return _resp(200, {"countries": get_shipping_country_defaults(table)})
     if method == "PUT" and path == "/admin/config/shipping-countries":
         return _put_shipping_countries(event, table, actor_sub, actor_email, req_id)
+
+    if method == "GET" and path == "/admin/config/max-coverage-by-currency":
+        return _resp(200, {"amounts": get_global_max_coverage_by_currency(table)})
+    if method == "PUT" and path == "/admin/config/max-coverage-by-currency":
+        return _put_max_coverage_by_currency(event, table, actor_sub, actor_email, req_id)
+
+    if method == "GET" and path == "/admin/config/activity-info":
+        return _resp(200, get_activity_info(table))
+
+    if method == "PUT" and path == "/admin/config/activity-info":
+        return _put_activity_info(event, table, actor_sub, actor_email, req_id)
+
+    if method == "GET" and path == "/admin/config/tips-info":
+        return _resp(200, get_tips_info(table))
+
+    if method == "PUT" and path == "/admin/config/tips-info":
+        return _put_tips_info(event, table, actor_sub, actor_email, req_id)
+
+    if method == "GET" and path == "/admin/config/calc-coverage-tips":
+        return _resp(200, get_calc_coverage_tips_global(table))
+
+    if method == "PUT" and path == "/admin/config/calc-coverage-tips":
+        return _put_calc_coverage_tips_global(event, table, actor_sub, actor_email, req_id)
 
     if method == "GET" and path == "/admin/shops":
         return _list_shops(event, table, actor_sub, req_id)
@@ -99,6 +172,15 @@ def handler(event, context):
     if method == "PUT" and len(parts) == 4 and parts[3] == "shipping-calc-settings":
         return _put_shipping_calc(event, table, shop, actor_sub, actor_email, req_id)
 
+    if method == "POST" and len(parts) == 4 and parts[3] == "sync-enabled-currencies":
+        return _post_admin_sync_shop_currencies(event, table, shop, actor_sub, actor_email, req_id)
+
+    if method == "GET" and len(parts) == 4 and parts[3] == "calc-coverage-tips":
+        return _get_shop_calc_coverage_tips(table, shop, actor_sub, req_id)
+
+    if method == "PUT" and len(parts) == 4 and parts[3] == "calc-coverage-tips":
+        return _put_shop_calc_coverage_tips(event, table, shop, actor_sub, actor_email, req_id)
+
     if method == "POST" and len(parts) == 5 and parts[3] == "features" and parts[4] == "return-insurance":
         return _feature_return(event, table, shop, actor_sub, actor_email, req_id)
     if method == "POST" and len(parts) == 5 and parts[3] == "features" and parts[4] == "shipping-protection":
@@ -111,7 +193,37 @@ def handler(event, context):
     return _resp(404, {"error": "not_found"})
 
 
-def _put_pricing(event, table, actor_sub: str, actor_email: str, req_id: str):
+def _put_supported_currencies(event, table, actor_sub: str, actor_email: str, req_id: str):
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    cur = body.get("currencies")
+    if not isinstance(cur, list):
+        return _resp(400, {"error": "currencies_array_required"})
+    try:
+        put_supported_currencies(table, [str(x) for x in cur], actor_sub)
+    except ValueError as e:
+        return _resp(400, {"error": "invalid_supported_currencies", "detail": str(e)})
+    append_audit(
+        table,
+        "_gwofy_system_",
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_SUPPORTED_CURRENCIES_UPDATE",
+        outcome="ok",
+        resource="supported_currencies",
+        actor_email=actor_email or None,
+        detail={"currencies": cur},
+        http_path="/admin/config/supported-currencies",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _put_pricing_currency(
+    event, table, currency: str, actor_sub: str, actor_email: str, req_id: str
+):
     try:
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
@@ -120,9 +232,10 @@ def _put_pricing(event, table, actor_sub: str, actor_email: str, req_id: str):
     if not isinstance(tiers, list):
         return _resp(400, {"error": "tiers_array_required"})
     try:
-        put_pricing_model(table, tiers, actor_sub)
+        put_pricing_model(table, tiers, actor_sub, currency=currency)
     except ValueError as e:
         return _resp(400, {"error": "invalid_tiers", "detail": str(e)})
+    http_path = event.get("requestContext", {}).get("http", {}).get("path", "")
     append_audit(
         table,
         "_gwofy_system_",
@@ -132,8 +245,174 @@ def _put_pricing(event, table, actor_sub: str, actor_email: str, req_id: str):
         outcome="ok",
         resource="pricing_model",
         actor_email=actor_email or None,
-        detail={"tier_count": len(tiers)},
-        http_path="/admin/config/pricing-model",
+        detail={"tier_count": len(tiers), "currency": currency},
+        http_path=http_path,
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _put_calc_coverage_tips_global(event, table, actor_sub: str, actor_email: str, req_id: str):
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    try:
+        put_calc_coverage_tips_global(table, body, actor_sub)
+    except ValueError as e:
+        return _resp(400, {"error": "invalid_calc_coverage_tips", "detail": str(e)})
+    append_audit(
+        table,
+        "_gwofy_system_",
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_CALC_COVERAGE_TIPS_GLOBAL_UPDATE",
+        outcome="ok",
+        resource="calc_coverage_tips_global",
+        actor_email=actor_email or None,
+        http_path="/admin/config/calc-coverage-tips",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _get_shop_calc_coverage_tips(table, shop: str, actor_sub: str, req_id: str):
+    meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    return _resp(
+        200,
+        {
+            "global": get_calc_coverage_tips_global(table),
+            "shopOverride": shop_override_snapshot(meta),
+            "effective": effective_calc_coverage_tips(table, meta),
+        },
+    )
+
+
+def _put_shop_calc_coverage_tips(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
+    pk = pk_shop(shop)
+    meta = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "invalid_body"})
+    allowed_keys = {"spBelowMinCoverageTip", "spGreaterMaxCoverageTip"}
+    if not body or set(body.keys()) - allowed_keys:
+        return _resp(400, {"error": "invalid_keys", "allowed": sorted(allowed_keys)})
+    mapping = {
+        "spBelowMinCoverageTip": META_SP_BELOW_MIN_COVERAGE_TIP,
+        "spGreaterMaxCoverageTip": META_SP_GREATER_MAX_COVERAGE_TIP,
+    }
+    sets: dict[str, str] = {}
+    removes: list[str] = []
+    for api_k, meta_k in mapping.items():
+        if api_k not in body:
+            continue
+        try:
+            v = validate_shop_tip_value(body[api_k])
+        except ValueError as e:
+            return _resp(400, {"error": "invalid_tip", "detail": str(e)})
+        if v is None:
+            removes.append(meta_k)
+        else:
+            sets[meta_k] = v
+    if not sets and not removes:
+        return _resp(400, {"error": "no_fields_to_update"})
+    now = datetime.now(timezone.utc).isoformat()
+    names: dict[str, str] = {}
+    values: dict[str, Any] = {":u": now}
+    set_parts: list[str] = []
+    idx = 0
+    for k, v in sets.items():
+        nk = f"#m{idx}"
+        vk = f":t{idx}"
+        names[nk] = k
+        values[vk] = v
+        set_parts.append(f"{nk} = {vk}")
+        idx += 1
+    remove_parts: list[str] = []
+    for k in removes:
+        nk = f"#m{idx}"
+        names[nk] = k
+        remove_parts.append(nk)
+        idx += 1
+    if set_parts:
+        ue = "SET " + ", ".join(set_parts) + ", updated_at = :u"
+    else:
+        ue = "SET updated_at = :u"
+    if remove_parts:
+        ue += " REMOVE " + ", ".join(remove_parts)
+    kwargs: dict[str, Any] = {
+        "Key": {"pk": pk, "sk": SK_METADATA},
+        "UpdateExpression": ue,
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": values,
+    }
+    table.update_item(**kwargs)
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_SHOP_CALC_COVERAGE_TIPS_UPDATE",
+        outcome="ok",
+        resource="calc_coverage_tips_shop",
+        actor_email=actor_email or None,
+        detail={"sets": list(sets.keys()), "removes": removes},
+        http_path=f"/admin/shops/{shop}/calc-coverage-tips",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _put_tips_info(event, table, actor_sub: str, actor_email: str, req_id: str):
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    try:
+        put_tips_info(table, body, actor_sub)
+    except ValueError as e:
+        return _resp(400, {"error": "invalid_tips_info", "detail": str(e)})
+    append_audit(
+        table,
+        "_gwofy_system_",
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_TIPS_INFO_UPDATE",
+        outcome="ok",
+        resource="tips_info",
+        actor_email=actor_email or None,
+        http_path="/admin/config/tips-info",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _put_activity_info(event, table, actor_sub: str, actor_email: str, req_id: str):
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    try:
+        put_activity_info(table, body, actor_sub)
+    except ValueError as e:
+        return _resp(400, {"error": "invalid_activity_info", "detail": str(e)})
+    append_audit(
+        table,
+        "_gwofy_system_",
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_ACTIVITY_INFO_UPDATE",
+        outcome="ok",
+        resource="activity_info",
+        actor_email=actor_email or None,
+        http_path="/admin/config/activity-info",
         request_id=req_id,
     )
     return _resp(200, {"ok": True})
@@ -167,6 +446,71 @@ def _put_shipping_countries(event, table, actor_sub: str, actor_email: str, req_
     return _resp(200, {"ok": True})
 
 
+def _put_max_coverage_by_currency(event, table, actor_sub: str, actor_email: str, req_id: str):
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    amounts = body.get("amounts")
+    if not isinstance(amounts, dict):
+        return _resp(400, {"error": "amounts_object_required"})
+    try:
+        put_global_max_coverage_by_currency(table, amounts, actor_sub)
+    except ValueError as e:
+        return _resp(400, {"error": "invalid_max_coverage_amounts", "detail": str(e)})
+    append_audit(
+        table,
+        "_gwofy_system_",
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_MAX_COVERAGE_BY_CURRENCY_UPDATE",
+        outcome="ok",
+        resource="max_coverage_by_currency",
+        actor_email=actor_email or None,
+        detail={"currency_count": len(amounts)},
+        http_path="/admin/config/max-coverage-by-currency",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True})
+
+
+def _post_admin_sync_shop_currencies(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
+    meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    enc = meta.get("access_token_enc")
+    if not enc:
+        return _resp(400, {"error": "missing_access_token"})
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    key_id = str(meta.get("kms_key_id") or kms_key_id)
+    try:
+        token = decrypt_token(key_id, str(enc))
+    except Exception as e:
+        return _resp(500, {"error": "token_decrypt_failed", "detail": str(e)[:200]})
+    api_version = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+    fb = str(meta.get("shop_currency_code") or "").strip().upper()
+    try:
+        codes = sync_shop_enabled_currencies(
+            table, shop, token, api_version, fallback_primary=fb or None
+        )
+    except Exception as e:
+        return _resp(502, {"error": "sync_shop_currencies_failed", "detail": str(e)[:500]})
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_SHOP_ENABLED_CURRENCIES_SYNC",
+        outcome="ok",
+        resource="shop_enabled_currencies",
+        actor_email=actor_email or None,
+        detail={"count": len(codes)},
+        http_path="/admin/shops/.../sync-enabled-currencies",
+        request_id=req_id,
+    )
+    return _resp(200, {"ok": True, "currencies": codes})
+
+
 def _put_shipping_calc(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
@@ -175,13 +519,23 @@ def _put_shipping_calc(event, table, shop: str, actor_sub: str, actor_email: str
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
         return _resp(400, {"error": "invalid_json"})
-    max_cov = body.get("sp_max_coverage_usd")
-    rates = body.get("sp_market_rates")
-    max_over = body.get("sp_country_max_overrides")
-    if max_cov is None and rates is None and max_over is None:
+    if body.get("sp_country_max_overrides") is not None:
         return _resp(
             400,
-            {"error": "one_of_sp_max_coverage_usd_sp_market_rates_sp_country_max_overrides_required"},
+            {
+                "error": "deprecated_sp_country_max_overrides",
+                "hint": "Use sp_max_coverage_by_currency (currency-keyed amounts) instead.",
+            },
+        )
+    max_cov = body.get("sp_max_coverage_usd")
+    rates = body.get("sp_market_rates")
+    max_by_ccy = body.get("sp_max_coverage_by_currency")
+    if max_cov is None and rates is None and max_by_ccy is None:
+        return _resp(
+            400,
+            {
+                "error": "one_of_sp_max_coverage_usd_sp_market_rates_sp_max_coverage_by_currency_required",
+            },
         )
 
     names: dict[str, str] = {"#u": "updated_at"}
@@ -207,21 +561,28 @@ def _put_shipping_calc(event, table, shop: str, actor_sub: str, actor_email: str
         vals[":mr"] = json.dumps(norm, ensure_ascii=False, sort_keys=True)
         parts_expr.append("#mr = :mr")
 
-    if max_over is not None:
-        if not isinstance(max_over, dict):
-            return _resp(400, {"error": "sp_country_max_overrides_must_be_object"})
-        norm_m: dict[str, float] = {}
-        for k, v in max_over.items():
-            cc = str(k).upper()
-            try:
-                norm_m[cc] = float(v)
-            except (TypeError, ValueError):
-                return _resp(400, {"error": "invalid_sp_country_max_overrides", "country": cc})
-            if norm_m[cc] <= 0:
-                return _resp(400, {"error": "max_override_must_be_positive", "country": cc})
-        names["#mo"] = "sp_country_max_overrides_json"
-        vals[":mo"] = json.dumps(norm_m, ensure_ascii=False, sort_keys=True)
-        parts_expr.append("#mo = :mo")
+    if max_by_ccy is not None:
+        if not isinstance(max_by_ccy, dict):
+            return _resp(400, {"error": "sp_max_coverage_by_currency_must_be_object"})
+        allowed = parse_shop_enabled_currencies_json(meta)
+        if not allowed:
+            return _resp(
+                400,
+                {
+                    "error": "shop_enabled_currencies_not_synced",
+                    "hint": "POST /api/shop-enabled-currencies/sync or POST /admin/shops/{shop}/sync-enabled-currencies",
+                },
+            )
+        verr = validate_shop_max_coverage_by_currency(max_by_ccy, allowed)
+        if verr:
+            return _resp(400, {"error": "invalid_sp_max_coverage_by_currency", "detail": verr})
+        try:
+            norm_m = normalize_shop_max_coverage_for_storage(max_by_ccy)
+        except ValueError as e:
+            return _resp(400, {"error": "invalid_sp_max_coverage_by_currency", "detail": str(e)})
+        names["#mb"] = "sp_max_coverage_by_currency_json"
+        vals[":mb"] = json.dumps(norm_m, ensure_ascii=False, sort_keys=True)
+        parts_expr.append("#mb = :mb")
 
     table.update_item(
         Key={"pk": pk_shop(shop), "sk": SK_METADATA},
@@ -241,7 +602,7 @@ def _put_shipping_calc(event, table, shop: str, actor_sub: str, actor_email: str
         detail={
             "has_max": max_cov is not None,
             "has_rates": rates is not None,
-            "has_max_overrides": max_over is not None,
+            "has_max_by_currency": max_by_ccy is not None,
         },
         http_path="/admin/shops/.../shipping-calc-settings",
         request_id=req_id,
@@ -302,7 +663,9 @@ def _get_shop(table, shop: str, actor_sub: str, req_id: str):
     it = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not it:
         return _resp(404, {"error": "not_found"})
-    return _resp(200, {"shop": it})
+    out = dict(it)
+    out["shop_enabled_currencies"] = sorted(parse_shop_enabled_currencies_json(it))
+    return _resp(200, {"shop": out})
 
 
 def _list_products(table, shop: str, actor_sub: str, req_id: str):

@@ -17,6 +17,15 @@ mutation ProductCreate($product: ProductCreateInput!) {
 }
 """
 
+PRODUCT_UPDATE = """
+mutation ProductUpdate($product: ProductUpdateInput!) {
+  productUpdate(product: $product) {
+    product { id }
+    userErrors { field message }
+  }
+}
+"""
+
 PRODUCT_VARIANTS_BULK_CREATE = """
 mutation PVBC($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
   productVariantsBulkCreate(productId: $productId, variants: $variants) {
@@ -59,6 +68,30 @@ mutation PVBD($productId: ID!, $variantsIds: [ID!]!) {
 }
 """
 
+PRODUCT_BY_ID_EXISTS = """
+query ProductByIdExists($id: ID!) {
+  product(id: $id) {
+    id
+  }
+}
+"""
+
+PRODUCTS_BY_HANDLE = """
+query ProductsByHandle($q: String!) {
+  products(first: 5, query: $q) {
+    edges {
+      node {
+        id
+        handle
+      }
+    }
+  }
+}
+"""
+
+# Raised when first activation finds another product already using our fixed handle.
+PROTECTION_HANDLE_ALREADY_EXISTS = "protection_handle_already_exists"
+
 
 def _err(data: dict[str, Any], key: str) -> None:
     root = data.get("data", {}).get(key) or {}
@@ -94,57 +127,111 @@ def _plan_value_from_variant(node: dict[str, Any]) -> str | None:
     return None
 
 
-def upsert_protection_product(
+def _product_id_exists(shop: str, token: str, api_version: str, product_gid: str) -> bool:
+    data = graphql_request(
+        shop, token, PRODUCT_BY_ID_EXISTS, {"id": product_gid}, api_version=api_version
+    )
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    p = data.get("data", {}).get("product")
+    return bool(p and p.get("id"))
+
+
+def _first_product_gid_by_handle(
+    shop: str, token: str, api_version: str, handle: str
+) -> str | None:
+    """Admin search `handle:<value>`; returns first matching product GID."""
+    h = (handle or "").strip()
+    if not h:
+        return None
+    q = f"handle:{h}"
+    data = graphql_request(shop, token, PRODUCTS_BY_HANDLE, {"q": q}, api_version=api_version)
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    edges = (data.get("data", {}).get("products") or {}).get("edges") or []
+    h_lower = h.lower()
+    for e in edges:
+        node = e.get("node") or {}
+        node_handle = str(node.get("handle") or "").strip().lower()
+        if node_handle != h_lower:
+            continue
+        gid = node.get("id")
+        if gid:
+            return str(gid)
+    return None
+
+
+def _sync_product_vendor(
     shop: str,
     token: str,
     api_version: str,
-    *,
-    existing_product_gid: str | None,
+    product_gid: str,
+    vendor: str,
+) -> None:
+    """Ensure product-level vendor on existing protection product (Shopify Admin GraphQL)."""
+    data = graphql_request(
+        shop,
+        token,
+        PRODUCT_UPDATE,
+        {"product": {"id": product_gid, "vendor": vendor}},
+        api_version=api_version,
+    )
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    _err(data, "productUpdate")
+
+
+def _create_new_protection_product(
+    shop: str,
+    token: str,
+    api_version: str,
     tiers_shop: list[tuple[str, Decimal, str]],
     title: str,
     vendor: str,
     product_type: str,
-    handle: str | None = None,
+    handle: str | None,
 ) -> str:
-    """
-    tiers_shop: (plan_code, price in shop currency, inventory SKU per variant).
-    Returns product GID.
-    """
-    shop = shop.strip().lower().rstrip("/")
+    first = tiers_shop[0]
+    rest = tiers_shop[1:]
+    product_input: dict[str, Any] = {
+        "title": title,
+        "vendor": vendor,
+        "productType": product_type,
+        "status": "UNLISTED",
+        "productOptions": [{"name": "Plan", "values": [{"name": first[0]}]}],
+        "variants": [
+            {
+                "price": format_money(first[1]),
+                "inventoryPolicy": "CONTINUE",
+                "taxable": True,
+                "inventoryItem": {"sku": first[2], "tracked": False},
+                "optionValues": [{"optionName": "Plan", "name": first[0]}],
+            }
+        ],
+    }
+    if handle:
+        product_input["handle"] = handle
+    data = graphql_request(shop, token, PRODUCT_CREATE, {"product": product_input}, api_version=api_version)
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    _err(data, "productCreate")
+    pid = (data.get("data", {}).get("productCreate") or {}).get("product", {}).get("id")
+    if not pid:
+        raise RuntimeError("product_create_missing_id")
+    _bulk_create_chunks(shop, token, api_version, str(pid), rest)
+    return str(pid)
+
+
+def _apply_tiers_to_existing_product(
+    shop: str,
+    token: str,
+    api_version: str,
+    pid: str,
+    tiers_shop: list[tuple[str, Decimal, str]],
+    vendor: str,
+) -> str:
+    _sync_product_vendor(shop, token, api_version, pid, vendor)
     want: dict[str, tuple[Decimal, str]] = {c: (p, s) for c, p, s in tiers_shop}
-
-    if not existing_product_gid:
-        first = tiers_shop[0]
-        rest = tiers_shop[1:]
-        product_input: dict[str, Any] = {
-            "title": title,
-            "vendor": vendor,
-            "productType": product_type,
-            "status": "UNLISTED",
-            "productOptions": [{"name": "Plan", "values": [{"name": first[0]}]}],
-            "variants": [
-                {
-                    "price": format_money(first[1]),
-                    "inventoryPolicy": "CONTINUE",
-                    "taxable": True,
-                    "inventoryItem": {"sku": first[2], "tracked": False},
-                    "optionValues": [{"optionName": "Plan", "name": first[0]}],
-                }
-            ],
-        }
-        if handle:
-            product_input["handle"] = handle
-        data = graphql_request(shop, token, PRODUCT_CREATE, {"product": product_input}, api_version=api_version)
-        if data.get("errors"):
-            raise RuntimeError(str(data["errors"]))
-        _err(data, "productCreate")
-        pid = (data.get("data", {}).get("productCreate") or {}).get("product", {}).get("id")
-        if not pid:
-            raise RuntimeError("product_create_missing_id")
-        _bulk_create_chunks(shop, token, api_version, str(pid), rest)
-        return str(pid)
-
-    pid = existing_product_gid
     nodes = _list_all_variant_nodes(shop, token, pid, api_version)
     by_plan: dict[str, str] = {}
     for n in nodes:
@@ -189,6 +276,62 @@ def upsert_protection_product(
             _err(data, "productVariantsBulkDelete")
 
     return str(pid)
+
+
+def upsert_protection_product(
+    shop: str,
+    token: str,
+    api_version: str,
+    *,
+    existing_product_gid: str | None,
+    tiers_shop: list[tuple[str, Decimal, str]],
+    title: str,
+    vendor: str,
+    product_type: str,
+    handle: str | None = None,
+) -> str:
+    """
+    tiers_shop: (plan_code, price in shop currency, inventory SKU per variant).
+    Returns product GID.
+
+    - First activation (no saved gid): if `handle` is already used by a product →
+      raise RuntimeError(PROTECTION_HANDLE_ALREADY_EXISTS).
+    - Reactivation (saved gid present): if saved product was deleted, resolve by
+      `handle` and update that product; if none with handle, create a new product.
+    """
+    shop = shop.strip().lower().rstrip("/")
+    saved_gid = (existing_product_gid or "").strip() or None
+    fixed_handle = (handle or "").strip() or None
+
+    resolved_pid: str | None = None
+    if saved_gid:
+        if _product_id_exists(shop, token, api_version, saved_gid):
+            resolved_pid = saved_gid
+        elif fixed_handle:
+            resolved_pid = _first_product_gid_by_handle(shop, token, api_version, fixed_handle)
+
+    if resolved_pid:
+        return _apply_tiers_to_existing_product(shop, token, api_version, resolved_pid, tiers_shop, vendor)
+
+    # Create path
+    if not saved_gid:
+        # First activation — refuse if another listing already owns our handle.
+        if fixed_handle:
+            conflict = _first_product_gid_by_handle(shop, token, api_version, fixed_handle)
+            if conflict:
+                raise RuntimeError(PROTECTION_HANDLE_ALREADY_EXISTS)
+    # Reactivation after delete (saved_gid was set but product gone; handle search empty): create
+
+    return _create_new_protection_product(
+        shop,
+        token,
+        api_version,
+        tiers_shop,
+        title,
+        vendor,
+        product_type,
+        fixed_handle,
+    )
 
 
 def _bulk_create_chunks(
