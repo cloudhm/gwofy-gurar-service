@@ -88,6 +88,25 @@ def merge_market_rates_json(
     return json.dumps(rates, ensure_ascii=False, sort_keys=True), changed
 
 
+def prune_market_rates_to_countries(existing_json: str | None, keep_country_codes: set[str]) -> tuple[str, bool]:
+    """Remove rate entries for countries no longer present in Shopify Markets (+ billing)."""
+    try:
+        rates = json.loads(existing_json or "{}")
+    except json.JSONDecodeError:
+        rates = {}
+    if not isinstance(rates, dict):
+        rates = {}
+    keep = {str(c).upper() for c in keep_country_codes}
+    changed = False
+    keys = list(rates.keys())
+    for k in keys:
+        ku = str(k).upper()
+        if ku not in keep:
+            del rates[k]
+            changed = True
+    return json.dumps(rates, ensure_ascii=False, sort_keys=True), changed
+
+
 def sync_market_rates_after_profile(
     table,
     shop: str,
@@ -113,6 +132,11 @@ def sync_market_rates_after_profile(
         allowed_countries=allowed,
         default_rates_by_country=rate_by_cc,
     )
+    keep_set = {str(c).upper() for c in countries if not allowed or str(c).upper() in allowed}
+    pruned_change = False
+    if keep_set:
+        merged, pruned_change = prune_market_rates_to_countries(merged, keep_set)
+    changed = changed or pruned_change
     max_cov = meta.get("sp_max_coverage_usd")
     need_max = max_cov is None
     if not changed and not need_max:
