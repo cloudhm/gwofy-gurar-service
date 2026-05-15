@@ -87,8 +87,21 @@ def handler(event, context):
 
 def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
     item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    cid = os.environ["SHOPIFY_CLIENT_ID"]
+    embed_url = f"https://{shop_host}/admin/themes/current/editor?context=apps&activateAppId={cid}"
     if not item:
-        return _resp(404, {"error": "shop_not_installed"})
+        safe = {
+            "shop": shop_host,
+            "installation_status": "NOT_INSTALLED",
+            "activation_status": "UNACTIVATED",
+            "return_insurance_status": "CLOSED",
+            "shipping_protection_status": "CLOSED",
+            "plugin_suspended": False,
+            "embed_enabled_ack": False,
+            "embed_deep_link": embed_url,
+            "shop_enabled_currencies": [],
+        }
+        return _resp(200, {"session": payload.get("sub"), "shop_metadata": safe})
     if item.get("plugin_suspended"):
         append_audit(
             table,
@@ -102,9 +115,6 @@ def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
             source_ip=_xff(headers),
         )
         return _resp(403, {"error": "plugin_suspended"})
-
-    cid = os.environ["SHOPIFY_CLIENT_ID"]
-    embed_url = f"https://{shop_host}/admin/themes/current/editor?context=apps&activateAppId={cid}"
 
     safe = {
         "shop": item.get("shop"),
@@ -458,8 +468,9 @@ def _cart_config(event, table, req_id: str):
 
 
 def _resp(code: int, body: dict):
+    # DynamoDB returns numbers as Decimal; default=str matches admin_handler and avoids 500 on json.dumps.
     return {
         "statusCode": code,
         "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body),
+        "body": json.dumps(body, default=str),
     }

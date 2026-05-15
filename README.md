@@ -190,11 +190,11 @@ jobs:
 
 4. 复制栈输出中的 **HttpApiUrl**，在 Partner Dashboard / `shopify.app.toml` 中将重定向 URI 设为 `{HttpApiUrl}/oauth/callback`，Webhook URL 设为 `{HttpApiUrl}/webhooks/shopify`。
 
-   **Webhook 订阅**：topic 列表以仓库根目录 `shopify.app.toml` 的 `[webhooks]` 为准（随应用配置同步到 Shopify）。OAuth 回调 **不再** 调用 Admin REST 注册 webhooks，避免与 App 配置 **重复订阅**、同一事件多次投递。
+   **Webhook 订阅**：topic 列表以仓库根目录 `shopify.app.toml` 的 `[webhooks]` 为准（含 **`products/delete`、`orders/delete`、`markets/delete`** 等删除感知 topic；随应用配置同步到 Shopify）。OAuth 回调 **不再** 调用 Admin REST 注册 webhooks，避免与 App 配置 **重复订阅**、同一事件多次投递。
 
    **Shopify 侧**：同一应用可在 Partner Dashboard 配置 **多个 redirect URL**（dev/staging/prod 各一条）；Webhook 地址亦可按环境各配一条。也可为 dev/prod 分别创建 Custom app，隔离 `client_id`。
 
-5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。
+5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。Worker 的 **`INITIAL_SYNC`** 仅做 **店铺资料**（币种、市场等）与 **自动激活**（创建 Shipping Protection 商品）；完成后 **异步入队 `CATALOG_SYNC`**，在后台慢慢全量拉取商品与订单。激活失败不阻塞入队；错误写入 `last_activation_error`，可稍后 **`POST /api/activate`** 重试。
 
    **可过期离线 token（Shopify 2025-12+）**：向 `https://{shop}/admin/oauth/authorize` 发起 **offline** 授权时，查询串须包含 **`expiring=1`**（与 [Shopify 文档](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens) 一致）。本仓库 `/oauth/callback` 换票已固定带 **`expiring=1`**，并在 Dynamo **METADATA** 写入 `refresh_token_enc`、`shopify_offline_access_token_expires_at`、`shopify_offline_refresh_token_expires_at`。Worker / 商户 / 管理接口在调用 Admin API 前会 **自动 refresh**；若仍为历史 **非过期** token，会在首次请求时 **一次性迁移** 为可过期对（旧 token 随即作废）。仅用 `POST /admin/tools/decrypt-shopify-token` 取出的明文若未经过上述逻辑，在 Postman 里可能仍被 Shopify 拒绝，请触发任意已接线路径或重装授权。
 
@@ -249,7 +249,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link`、`last_activation_error`（激活失败时的 JSON 字符串，成功激活后清除）等 |
-| POST | `/api/activate` | **同步**激活或再次激活：商户 Lambda 内用店铺离线 token 创建/更新 Shipping Protection 商品并写回 `protection_product_gid`。成功 **200** `{"ok":true,"activation_status":"ACTIVATED"}`；业务错误 **400**（如 `shop_profile_not_ready`、`currency_not_supported`、`pricing_not_configured`）；解密/Shopify 异常 **500/502**。激活**不会**调用 `sync_shop_profile`；`shop_currency_code` 须已由安装全量同步 / webhook / 定时对账写入 METADATA。HTTP API 与 Lambda 超时请见栈配置（商户 Lambda 已放宽以便多变体 upsert）。 |
+| POST | `/api/activate` | **同步**激活或再次激活（安装后 Worker 也会自动尝试一次）：商户 Lambda 内用店铺离线 token 创建/更新 Shipping Protection 商品并写回 `protection_product_gid`。成功 **200** `{"ok":true,"activation_status":"ACTIVATED"}`；业务错误 **400**（如 `shop_profile_not_ready`、`currency_not_supported`、`pricing_not_configured`）；解密/Shopify 异常 **500/502**。激活**不会**调用 `sync_shop_profile`；`shop_currency_code` 须已由安装全量同步 / webhook / 定时对账写入 METADATA。HTTP API 与 Lambda 超时请见栈配置（商户 Lambda 已放宽以便多变体 upsert）。 |
 | PATCH | `/api/me/embed` | JSON body：`{"embed_enabled_ack": true}` |
 | POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）、`shopDomain`。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`（`country` 仅用于 **费率** 等，**不参与保额**）。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。**响应** `calcInfo` 含 **`maxAmount`**、**`maxAmountCurrency`**、`spRate` 等；并含 **`merchantPremiumRules`**（从店铺 `METADATA.merchant_premium_rules_json` 解析，与 **`GET /api/me/merchant-premium-rules`** 同源；无效或缺失时为默认空规则）。**服务端不下发最终加价后金额**， storefront / App 按规则自行计算。 |
 | GET | `/api/me/merchant-premium-rules` | 返回 **`{"merchantPremiumRules":{...}}`**（店主配置的加成 / 满减等；店铺须 **ACTIVE** 且未挂起）。 |
@@ -282,7 +282,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `POST /admin/tools/decrypt-shopify-token`，body：`{"access_token_enc":"<KMS Base64 密文>","kms_key_id":"<可选，缺省用 Lambda KMS_KEY_ID>","shop":"<可选，审计归属店铺 host；缺省为内部占位>"}` → **200** `{"ok":true,"access_token":"<明文 Shopify token>"}`（**极高敏感**，仅管理组；失败 **502** `decrypt_failed`；写审计 **`ADMIN_DECRYPT_SHOPIFY_TOKEN`**，**detail 不含明文**）
   - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
-  - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`（`only_protection=true`：`has_shipping_protection`；`tag=<字符串>`：仅返回 `sync_tags` 中含该值的订单；二者可组合）
+  - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`：商品/订单行含 **`payload`（JSON 快照）** 与顶栏筛选字段。商品含 **`product_handle`、`product_title`、`product_status`（Shopify 状态）、`price_min`/`price_max`、`variant_count`、`sync_deleted`、`deleted_at`**；订单含 **`order_name`、`legacy_resource_id`、`display_financial_status`、`display_fulfillment_status`、`current_total_price`（Decimal）、`sync_deleted`、`deleted_at`**。查询参数：`include_deleted=true` 含已删除镜像；商品可加 `product_handle_prefix`、`product_status`；订单可加 `financial_status`（与 `display_financial_status` 匹配）、`order_name_prefix`；原：`only_protection`、`tag`；`limit` 默认 100、最大 500。Webhook **`products/delete` / `orders/delete`** 会将对应 `PRODUCT#` / `ORDER#` 标为 `sync_deleted`（保留最后 `payload`）；**`markets/delete`** 触发重新拉 Markets 并 **修剪** `sp_market_rates_json` 中已不在市场的国家键。
   - `GET /admin/shops/{shop}/audit`（审计流水）
   - `GET /admin/config/supported-currencies` → `{"currencies":["USD","EUR",...]}`（管理员启用的币种，须为代码内允许列表的子集）
   - `PUT /admin/config/supported-currencies`，body：`{"currencies":["USD","EUR"]}`（非空、去重、大写存储）
@@ -299,6 +299,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `PUT /admin/shops/{shop}/calc-coverage-tips`，body 可只含其一或两项：`spBelowMinCoverageTip`、`spGreaterMaxCoverageTip`；值为 **`null`** 表示删除该字段覆盖并回退全局 — 与 **`POST /api/cart-config`** 里 **`calcInfo.spBelowMinCoverageTip` / `spGreaterMaxCoverageTip`** 同源（**已移除** `calcInfo` 中的 `spMaxCoverage`、`spMinCoverage`、`zeroBuyConf`，保额上限仍以 **`maxAmount`** 表示）
   - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、**`sp_max_coverage_by_currency`**（不再接受 `sp_country_max_overrides`）
   - `POST /admin/shops/{shop}/sync-enabled-currencies` — 用店铺离线 token 拉取 Shopify 启用货币列表（与商户 **`POST /api/shop-enabled-currencies/sync`** 同源逻辑）
+  - `POST /admin/shops/{shop}/sync` — **手动拉取/更新** 店铺镜像数据。Body：`{"resources":["all"]}` 或 `["shop_profile","products","orders","currencies","markets","catalog"]`（`catalog` = 商品+订单）；**`async`** 默认 **`true`**（入队 Worker，**202**）；**`false`** 时在 Admin Lambda 内同步执行（**29s** 超时，仅适合 profile/currencies/markets）。**`reset_checkpoints`**：`true` 时商品/订单全量从第一页重拉。同步模式成功 **200** / 部分失败 **502**，返回 **`steps`** 各资源结果。
 
 定价 / 变体模板 / 支持国家（仅 rate）/ **按币种全局保额** `MAX_COVERAGE_BY_CURRENCY` / **activityInfo** / **tipsInfo** / **calc-coverage-tips（全局）** 缺省时 Worker 会种子写入 `GLOBAL#CONFIG` 下 **`PRICING_MODEL#USD`**（默认 98 档）、**`SUPPORTED_CURRENCIES`**（默认 `["USD"]`）、**`MAX_COVERAGE_BY_CURRENCY`**（默认 `USD:9000`）、`SHIPPING_COUNTRY_DEFAULTS`（各国仅 `rate`）、**`ACTIVITY_INFO`**、**`TIPS_INFO`** 与 **`CALC_COVERAGE_TIPS`**（默认可为空文案）。旧版 **`PRICING_MODEL_DEFAULT`** 若存在则迁移到 **`PRICING_MODEL#USD`**。**店铺级**提示写在对应店铺 **`METADATA`** 的 `sp_below_min_coverage_tip` / `sp_greater_max_coverage_tip`。DynamoDB 表含 **GSI2**（`SHOP_INDEX`）用于列举店铺。
 

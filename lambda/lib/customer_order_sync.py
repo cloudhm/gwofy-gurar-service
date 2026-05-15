@@ -9,33 +9,179 @@ from typing import Any
 from .models import pk_tenant
 from .order_protection import order_has_protection_product
 from .shopify_api import graphql_request
+from .sync_denorm import denorm_order_top_fields
 from .sync_order_tags import order_sync_tags
 
-ORDERS_Q = """
-query OrdersPage($cursor: String) {
-  orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
-    pageInfo { hasNextPage endCursor }
-    edges {
-      node {
+_ORDER_HEADER_FIELDS = """
         id
         legacyResourceId
         updatedAt
         name
         processedAt
         createdAt
-        lineItems(first: 50) {
-          edges {
-            node {
-              quantity
-              product { id }
-            }
+        displayFinancialStatus
+        displayFulfillmentStatus
+        tags
+        note
+        currentTotalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
           }
+        }
+        subtotalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        totalTaxSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+"""
+
+_LINE_ITEM_NODE_FIELDS = """
+              id
+              name
+              title
+              sku
+              quantity
+              vendor
+              variantTitle
+              requiresShipping
+              taxable
+              originalUnitPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+              discountedUnitPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+              image {
+                url
+                altText
+              }
+              product {
+                id
+                title
+                handle
+              }
+              variant {
+                id
+                sku
+                title
+                barcode
+                image {
+                  url
+                  altText
+                }
+              }
+"""
+
+ORDERS_Q = (
+    """
+query OrdersPage($cursor: String) {
+  orders(first: 50, after: $cursor, sortKey: UPDATED_AT, reverse: true) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+"""
+    + _ORDER_HEADER_FIELDS
+    + """
+      }
+    }
+  }
+}
+"""
+)
+
+ORDER_HEAD_Q = (
+    """
+query OrderHead($id: ID!) {
+  order(id: $id) {
+"""
+    + _ORDER_HEADER_FIELDS
+    + """
+  }
+}
+"""
+)
+
+ORDER_LINES_PAGE_Q = (
+    """
+query OrderLines($id: ID!, $cursor: String) {
+  order(id: $id) {
+    lineItems(first: 250, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+"""
+    + _LINE_ITEM_NODE_FIELDS
+    + """
         }
       }
     }
   }
 }
 """
+)
+
+
+def _raise_if_errors(data: dict[str, Any], ctx: str) -> None:
+    errs = data.get("errors")
+    if errs:
+        raise RuntimeError(f"{ctx}: {errs}")
+
+
+def merge_order_all_line_items(
+    shop: str, token: str, order_head: dict[str, Any], api_version: str
+) -> dict[str, Any]:
+    """Attach all line items (paginated) to an order node that has header fields only."""
+    shop_norm = shop.strip().lower().rstrip("/")
+    oid = order_head["id"]
+    out = {**order_head}
+    edges: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        data = graphql_request(
+            shop_norm,
+            token,
+            ORDER_LINES_PAGE_Q,
+            {"id": oid, "cursor": cursor},
+            api_version=api_version,
+        )
+        _raise_if_errors(data, "order_line_items")
+        conn = ((data.get("data") or {}).get("order") or {}).get("lineItems") or {}
+        edges.extend(conn.get("edges") or [])
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor = pi.get("endCursor")
+    out["lineItems"] = {"edges": edges}
+    return out
+
+
+def fetch_merged_order_node(
+    shop: str, token: str, order_gid: str, api_version: str
+) -> dict[str, Any] | None:
+    """Load order header + every line item page (e.g. webhook refresh)."""
+    shop_norm = shop.strip().lower().rstrip("/")
+    data = graphql_request(
+        shop_norm, token, ORDER_HEAD_Q, {"id": order_gid}, api_version=api_version
+    )
+    _raise_if_errors(data, "order_head")
+    head = (data.get("data") or {}).get("order")
+    if not head:
+        return None
+    return merge_order_all_line_items(shop_norm, token, head, api_version)
 
 
 def sync_orders(
@@ -61,8 +207,9 @@ def sync_orders(
             raise RuntimeError(str(data["errors"]))
         conn = data["data"]["orders"]
         for edge in conn["edges"]:
-            n = edge["node"]
-            gid = n["id"]
+            head = edge["node"]
+            gid = head["id"]
+            n = merge_order_all_line_items(shop_norm, token, head, api_version)
             has_prot = order_has_protection_product(n, protection_product_gid)
             table.put_item(
                 Item={
@@ -74,6 +221,9 @@ def sync_orders(
                     "shopify_id": gid,
                     "has_shipping_protection": has_prot,
                     "sync_tags": order_sync_tags(has_prot, protection_product_gid),
+                    "sync_deleted": False,
+                    "deleted_at": None,
+                    **denorm_order_top_fields(n),
                 }
             )
         page = conn["pageInfo"]

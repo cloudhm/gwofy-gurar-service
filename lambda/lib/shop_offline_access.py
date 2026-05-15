@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
+
 from .kms_tokens import decrypt_refresh_token, decrypt_token, encrypt_refresh_token, encrypt_token
 from .models import SK_METADATA, pk_shop
 from .shopify_api import migrate_non_expiring_offline_token, refresh_offline_access_token
@@ -15,6 +17,9 @@ logger = logging.getLogger(__name__)
 ACCESS_EXPIRES_AT = "shopify_offline_access_token_expires_at"
 REFRESH_EXPIRES_AT = "shopify_offline_refresh_token_expires_at"
 REFRESH_ENC = "refresh_token_enc"
+
+# Merchant must complete OAuth again; oauth_handler sets ACTIVE on reinstall.
+INSTALLATION_STATUS_OFFLINE_AUTH_EXPIRED = "OFFLINE_AUTH_EXPIRED"
 
 _ACCESS_SKEW = timedelta(seconds=120)
 _REFRESH_SKEW = timedelta(seconds=120)
@@ -44,6 +49,24 @@ def _refresh_still_valid(refresh_exp: datetime | None, now: datetime) -> bool:
     if refresh_exp is None:
         return True
     return now < refresh_exp - _REFRESH_SKEW
+
+
+def mark_installation_offline_auth_expired(table: Any, shop: str) -> None:
+    """Set installation_status when offline refresh is unusable (calendar or Shopify 401)."""
+    shop_norm = shop.strip().lower().rstrip("/")
+    now = datetime.now(timezone.utc).isoformat()
+    table.update_item(
+        Key={"pk": pk_shop(shop_norm), "sk": SK_METADATA},
+        UpdateExpression="SET installation_status = :s, updated_at = :u",
+        ExpressionAttributeValues={
+            ":s": INSTALLATION_STATUS_OFFLINE_AUTH_EXPIRED,
+            ":u": now,
+        },
+    )
+    logger.info(
+        "installation_marked_offline_auth_expired",
+        extra={"shop": shop_norm},
+    )
 
 
 def persist_expiring_offline_tokens(
@@ -124,6 +147,7 @@ def get_fresh_shop_access_token(
 
     if refresh_enc:
         if not _refresh_still_valid(refresh_exp, now):
+            mark_installation_offline_auth_expired(table, shop_norm)
             raise RuntimeError(
                 "shopify_refresh_token_expired_merchant_must_reauthorize_app_in_shopify_admin"
             )
@@ -131,7 +155,12 @@ def get_fresh_shop_access_token(
             return access_plain
         r_plain = decrypt_refresh_token(key_id, str(refresh_enc))
         logger.info("shopify_offline_token_refresh", extra={"shop": shop_norm})
-        resp = refresh_offline_access_token(shop_norm, client_id, client_secret, r_plain)
+        try:
+            resp = refresh_offline_access_token(shop_norm, client_id, client_secret, r_plain)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                mark_installation_offline_auth_expired(table, shop_norm)
+            raise
         persist_expiring_offline_tokens(table, shop_norm, key_id, resp)
         return str(resp.get("access_token") or "")
 
@@ -139,6 +168,11 @@ def get_fresh_shop_access_token(
         return access_plain
 
     logger.info("shopify_offline_token_migrate_non_expiring", extra={"shop": shop_norm})
-    resp = migrate_non_expiring_offline_token(shop_norm, client_id, client_secret, access_plain)
+    try:
+        resp = migrate_non_expiring_offline_token(shop_norm, client_id, client_secret, access_plain)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            mark_installation_offline_auth_expired(table, shop_norm)
+        raise
     persist_expiring_offline_tokens(table, shop_norm, key_id, resp)
     return str(resp.get("access_token") or "")

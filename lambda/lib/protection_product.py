@@ -11,7 +11,15 @@ from .shopify_api import graphql_request
 PRODUCT_CREATE = """
 mutation ProductCreate($product: ProductCreateInput!) {
   productCreate(product: $product) {
-    product { id }
+    product {
+      id
+      variants(first: 5) {
+        nodes {
+          id
+          selectedOptions { name value }
+        }
+      }
+    }
     userErrors { field message }
   }
 }
@@ -181,6 +189,19 @@ def _sync_product_vendor(
     _err(data, "productUpdate")
 
 
+def _variant_bulk_input(code: str, price: Decimal, sku: str, *, variant_id: str | None = None) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "price": format_money(price),
+        "inventoryPolicy": "CONTINUE",
+        "taxable": True,
+        "inventoryItem": {"sku": sku, "tracked": False},
+        "optionValues": [{"optionName": "Plan", "name": code}],
+    }
+    if variant_id:
+        row["id"] = variant_id
+    return row
+
+
 def _create_new_protection_product(
     shop: str,
     token: str,
@@ -191,35 +212,63 @@ def _create_new_protection_product(
     product_type: str,
     handle: str | None,
 ) -> str:
-    first = tiers_shop[0]
-    rest = tiers_shop[1:]
+    """
+    Shopify 2025+ productCreate: ProductCreateInput no longer accepts `variants`.
+    Create product + options, set price on the default variant, bulk-create the rest.
+    """
+    if not tiers_shop:
+        raise RuntimeError("protection_product_no_tiers")
+
+    option_values = [{"name": code} for code, _, _ in tiers_shop]
     product_input: dict[str, Any] = {
         "title": title,
         "vendor": vendor,
         "productType": product_type,
         "status": "UNLISTED",
-        "productOptions": [{"name": "Plan", "values": [{"name": first[0]}]}],
-        "variants": [
-            {
-                "price": format_money(first[1]),
-                "inventoryPolicy": "CONTINUE",
-                "taxable": True,
-                "inventoryItem": {"sku": first[2], "tracked": False},
-                "optionValues": [{"optionName": "Plan", "name": first[0]}],
-            }
-        ],
+        "productOptions": [{"name": "Plan", "values": option_values}],
     }
     if handle:
         product_input["handle"] = handle
+
     data = graphql_request(shop, token, PRODUCT_CREATE, {"product": product_input}, api_version=api_version)
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
     _err(data, "productCreate")
-    pid = (data.get("data", {}).get("productCreate") or {}).get("product", {}).get("id")
+    product = (data.get("data", {}).get("productCreate") or {}).get("product") or {}
+    pid = product.get("id")
     if not pid:
         raise RuntimeError("product_create_missing_id")
-    _bulk_create_chunks(shop, token, api_version, str(pid), rest)
-    return str(pid)
+    pid = str(pid)
+
+    first_code, first_price, first_sku = tiers_shop[0]
+    rest = tiers_shop[1:]
+    nodes = (product.get("variants") or {}).get("nodes") or []
+    if not nodes:
+        nodes = _list_all_variant_nodes(shop, token, pid, api_version)
+
+    if nodes:
+        default_vid = str(nodes[0]["id"])
+        update_row = _variant_bulk_input(first_code, first_price, first_sku, variant_id=default_vid)
+        data_u = graphql_request(
+            shop,
+            token,
+            PRODUCT_VARIANTS_BULK_UPDATE,
+            {"productId": pid, "variants": [update_row]},
+            api_version=api_version,
+        )
+        if data_u.get("errors"):
+            raise RuntimeError(str(data_u["errors"]))
+        _err(data_u, "productVariantsBulkUpdate")
+    elif rest:
+        # No default variant returned — create all tiers via bulk create.
+        _bulk_create_chunks(shop, token, api_version, pid, tiers_shop)
+        return pid
+    else:
+        raise RuntimeError("product_create_no_default_variant")
+
+    if rest:
+        _bulk_create_chunks(shop, token, api_version, pid, rest)
+    return pid
 
 
 def _apply_tiers_to_existing_product(
@@ -344,16 +393,7 @@ def _bulk_create_chunks(
 ) -> None:
     for i in range(0, len(tiers), chunk_size):
         chunk = tiers[i : i + chunk_size]
-        variants = [
-            {
-                "price": format_money(price),
-                "inventoryPolicy": "CONTINUE",
-                "taxable": True,
-                "inventoryItem": {"sku": sku, "tracked": False},
-                "optionValues": [{"optionName": "Plan", "name": code}],
-            }
-            for code, price, sku in chunk
-        ]
+        variants = [_variant_bulk_input(code, price, sku) for code, price, sku in chunk]
         data = graphql_request(
             shop, token, PRODUCT_VARIANTS_BULK_CREATE, {"productId": product_gid, "variants": variants}, api_version=api_version
         )

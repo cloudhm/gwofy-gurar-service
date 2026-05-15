@@ -10,7 +10,9 @@ from typing import Any
 
 import boto3
 
-from lib.customer_order_sync import sync_orders
+from lib.activate_app import ActivateAppError, run_activate_app_safe
+from lib.admin_shop_sync import run_admin_shop_sync
+from lib.customer_order_sync import fetch_merged_order_node, sync_orders
 from lib.feishu import send_text
 from lib.logging_json import setup_logging
 from lib.models import SK_METADATA, SK_WEBHOOK_PROCESSED, pk_shop, pk_tenant, pk_webhook
@@ -22,15 +24,21 @@ from lib.tips_config import ensure_tips_info_seed
 from lib.pricing_config import ensure_default_pricing_seed
 from lib.max_coverage_config import ensure_max_coverage_seed
 from lib.shipping_country_defaults import ensure_shipping_country_defaults_seed
+from lib.markets_sync import sync_market_rates_after_profile
+from lib.product_sync import _snapshot_hash as product_snapshot_hash
+from lib.product_sync import fetch_merged_product_node
+from lib.product_sync import product_snapshot_from_graphql
 from lib.product_sync import sync_products_initial
 from lib.shop_profile_sync import sync_shop_profile
 from lib.shopify_api import DEFAULT_API_VERSION, graphql_request
+from lib.sync_denorm import denorm_order_top_fields, denorm_product_top_fields
 from lib.order_protection import order_has_protection_product
 from lib.sync_order_tags import order_sync_tags
 
 logger = setup_logging("worker")
 
 ddb = boto3.resource("dynamodb")
+sqs = boto3.client("sqs")
 kms_key_id_env = None
 
 
@@ -71,6 +79,8 @@ def _job_summary(body: dict[str, Any]) -> dict[str, Any]:
         summary["webhook_body_len"] = len(body.get("body") or "")
     if src == "reconcile":
         summary["reconcile_resource"] = body.get("resource")
+    if src == "admin_api":
+        summary["admin_sync_resources"] = body.get("resources")
     return summary
 
 
@@ -83,6 +93,8 @@ def _oauth_install_job_sort_key(body: dict[str, Any]) -> int:
         return 0
     if ev == "INITIAL_SYNC":
         return 1
+    if ev == "CATALOG_SYNC":
+        return 2
     return 50
 
 
@@ -157,7 +169,9 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
         shop = body["shop"]
         store_number = body["store_number"]
         if ev == "INITIAL_SYNC":
-            run_initial_sync(table, shop, store_number, kms_key_id, api_version)
+            run_install_bootstrap(table, shop, store_number, kms_key_id, api_version)
+        elif ev == "CATALOG_SYNC":
+            run_catalog_sync(table, shop, store_number, kms_key_id, api_version)
         elif ev == "APP_INSTALLED":
             send_text(
                 feishu_url,
@@ -188,8 +202,38 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
     if src == "reconcile":
         shop = body["shop"]
         store_number = body["store_number"]
-        run_initial_sync(table, shop, store_number, kms_key_id, api_version)
+        run_install_bootstrap(
+            table, shop, store_number, kms_key_id, api_version, enqueue_catalog=False
+        )
+        run_catalog_sync(table, shop, store_number, kms_key_id, api_version)
         _advance_reconcile_marker(table, shop, body.get("resource", "ALL"))
+        return
+
+    if src == "admin_api":
+        shop = body["shop"]
+        store_number = str(body.get("store_number", ""))
+        meta = _shop_row(table, shop)
+        if not meta or meta.get("installation_status") != "ACTIVE":
+            logger.info("skip_admin_sync_inactive", extra={"shop": shop})
+            return
+        enc = meta.get("access_token_enc")
+        if not enc:
+            logger.warning("skip_admin_sync_no_token", extra={"shop": shop})
+            return
+        token = _shop_admin_token(table, shop, kms_key_id)
+        ver = body.get("api_version") or api_version
+        resources = body.get("resources") or ["all"]
+        reset_cp = bool(body.get("reset_checkpoints"))
+        run_admin_shop_sync(
+            table,
+            shop,
+            store_number,
+            token,
+            kms_key_id,
+            ver,
+            resources if isinstance(resources, list) else [str(resources)],
+            reset_checkpoints=reset_cp,
+        )
         return
 
     if src == "webhook_ingress":
@@ -203,8 +247,197 @@ def _shop_row(table, shop: str) -> dict[str, Any] | None:
     return table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
 
 
-def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:
-    logger.info("initial_sync_start", extra={"shop": shop, "store_number": store_number, "api_version": api_version})
+def _product_gid_from_webhook_body(body: dict[str, Any]) -> str | None:
+    pid = body.get("admin_graphql_api_id")
+    if not pid and body.get("id") is not None:
+        pid = f"gid://shopify/Product/{body['id']}"
+    return str(pid).strip() if pid else None
+
+
+def _order_gid_from_webhook_body(body: dict[str, Any]) -> str | None:
+    oid = body.get("admin_graphql_api_id")
+    if not oid and body.get("id") is not None:
+        oid = f"gid://shopify/Order/{body['id']}"
+    return str(oid).strip() if oid else None
+
+
+def handle_product_deleted(table, shop: str, store_number: str, raw_body: str) -> None:
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        return
+    gid = _product_gid_from_webhook_body(body)
+    if not gid:
+        logger.warning("product_delete_missing_id", extra={"shop": shop})
+        return
+    pk_t = pk_tenant(store_number)
+    sk_p = f"PRODUCT#{gid}"
+    prev = table.get_item(Key={"pk": pk_t, "sk": sk_p}).get("Item")
+    now = datetime.now(timezone.utc).isoformat()
+    prev_payload: dict[str, Any] = {}
+    if prev:
+        try:
+            prev_payload = json.loads(prev.get("payload") or "{}")
+        except json.JSONDecodeError:
+            prev_payload = {}
+    tomb_snap = {
+        "gid": gid,
+        "deleted": True,
+        "variants": [],
+        "handle": prev_payload.get("handle"),
+        "title": prev_payload.get("title"),
+        "status": "DELETED",
+    }
+    h = product_snapshot_hash(tomb_snap)
+    snap_for_denorm = {
+        "gid": gid,
+        "handle": prev_payload.get("handle") or "",
+        "title": prev_payload.get("title") or "",
+        "status": "DELETED",
+        "variants": [],
+    }
+    denorm = denorm_product_top_fields(snap_for_denorm)
+    denorm["sync_deleted"] = True
+    denorm["deleted_at"] = now
+    payload_out = (prev or {}).get("payload") or json.dumps({"gid": gid, "sync_deleted": True}, default=str)
+    table.put_item(
+        Item={
+            "pk": pk_t,
+            "sk": sk_p,
+            "payload": payload_out,
+            "snapshot_hash": h,
+            "updated_at_source": now,
+            "synced_at": now,
+            "shopify_id": gid,
+            **denorm,
+        }
+    )
+    logger.info("product_mirror_deleted", extra={"shop": shop, "gid": gid})
+
+
+def handle_order_deleted(table, shop: str, store_number: str, raw_body: str) -> None:
+    try:
+        body = json.loads(raw_body) if raw_body else {}
+    except json.JSONDecodeError:
+        return
+    gid = _order_gid_from_webhook_body(body)
+    if not gid:
+        logger.warning("order_delete_missing_id", extra={"shop": shop})
+        return
+    pk_t = pk_tenant(store_number)
+    sk_p = f"ORDER#{gid}"
+    prev = table.get_item(Key={"pk": pk_t, "sk": sk_p}).get("Item")
+    now = datetime.now(timezone.utc).isoformat()
+    prev_payload: dict[str, Any] = {}
+    if prev:
+        try:
+            prev_payload = json.loads(prev.get("payload") or "{}")
+        except json.JSONDecodeError:
+            prev_payload = {}
+    tomb_snap = {"gid": gid, "deleted": True}
+    h = product_snapshot_hash(tomb_snap)
+    denorm = denorm_order_top_fields(
+        {
+            "name": prev_payload.get("name"),
+            "legacyResourceId": prev_payload.get("legacyResourceId"),
+        }
+    )
+    denorm["sync_deleted"] = True
+    denorm["deleted_at"] = now
+    payload_out = (prev or {}).get("payload") or json.dumps({"id": gid, "sync_deleted": True}, default=str)
+    table.put_item(
+        Item={
+            "pk": pk_t,
+            "sk": sk_p,
+            "payload": payload_out,
+            "snapshot_hash": h,
+            "updated_at_source": now,
+            "synced_at": now,
+            "shopify_id": gid,
+            "has_shipping_protection": False,
+            "sync_tags": [],
+            **denorm,
+        }
+    )
+    logger.info("order_mirror_deleted", extra={"shop": shop, "gid": gid})
+
+
+def _maybe_auto_activate(
+    table,
+    shop: str,
+    store_number: str,
+    token: str,
+    kms_key_id: str,
+    api_version: str,
+    meta: dict[str, Any],
+) -> None:
+    """After install profile sync, create/update Shipping Protection product if not yet activated."""
+    if str(meta.get("activation_status") or "") == "ACTIVATED":
+        logger.info("auto_activate_skip_already_activated", extra={"shop": shop})
+        return
+    logger.info("initial_sync_phase", extra={"phase": "auto_activate", "shop": shop})
+    try:
+        run_activate_app_safe(
+            table,
+            shop,
+            store_number,
+            token,
+            kms_key_id,
+            api_version,
+            actor_sub="initial_sync",
+        )
+        logger.info("auto_activate_success", extra={"shop": shop, "store_number": store_number})
+    except ActivateAppError as e:
+        logger.warning(
+            "auto_activate_business_error",
+            extra={"shop": shop, "code": e.code, "detail": e.message[:500]},
+        )
+    except Exception:
+        logger.exception("auto_activate_failed", extra={"shop": shop})
+
+
+def _enqueue_catalog_sync(shop: str, store_number: str, api_version: str) -> None:
+    q = os.environ.get("WORK_QUEUE_URL")
+    if not q:
+        logger.warning("catalog_sync_enqueue_skipped_no_queue", extra={"shop": shop})
+        return
+    body = {
+        "source": "oauth",
+        "event": "CATALOG_SYNC",
+        "shop": shop,
+        "store_number": store_number,
+        "api_version": api_version,
+    }
+    r = sqs.send_message(QueueUrl=q, MessageBody=json.dumps(body))
+    logger.info(
+        "catalog_sync_enqueued",
+        extra={"shop": shop, "store_number": store_number, "sqs_message_id": r.get("MessageId")},
+    )
+
+
+def _ensure_global_config_seeds(table_name: str) -> None:
+    ensure_default_pricing_seed(table_name)
+    ensure_shipping_country_defaults_seed(table_name)
+    ensure_max_coverage_seed(table_name)
+    ensure_activity_info_seed(table_name)
+    ensure_tips_info_seed(table_name)
+    ensure_calc_coverage_tips_seed(table_name)
+
+
+def run_install_bootstrap(
+    table,
+    shop: str,
+    store_number: str,
+    kms_key_id: str,
+    api_version: str,
+    *,
+    enqueue_catalog: bool = True,
+) -> None:
+    """Shop profile + markets/currency, then activate; optionally enqueue async catalog sync."""
+    logger.info(
+        "install_bootstrap_start",
+        extra={"shop": shop, "store_number": store_number, "api_version": api_version},
+    )
     meta = _shop_row(table, shop)
     if not meta or meta.get("installation_status") != "ACTIVE":
         logger.info("skip_sync_not_active", extra={"shop": shop})
@@ -214,23 +447,47 @@ def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
         logger.warning("skip_sync_no_token", extra={"shop": shop})
         return
     token = _shop_admin_token(table, shop, kms_key_id)
-    ensure_default_pricing_seed(os.environ["TABLE_NAME"])
-    ensure_shipping_country_defaults_seed(os.environ["TABLE_NAME"])
-    ensure_max_coverage_seed(os.environ["TABLE_NAME"])
-    ensure_activity_info_seed(os.environ["TABLE_NAME"])
-    ensure_tips_info_seed(os.environ["TABLE_NAME"])
-    ensure_calc_coverage_tips_seed(os.environ["TABLE_NAME"])
-    logger.info("initial_sync_phase", extra={"phase": "shop_profile", "shop": shop})
+    table_name = os.environ["TABLE_NAME"]
+    _ensure_global_config_seeds(table_name)
+    logger.info("install_bootstrap_phase", extra={"phase": "shop_profile", "shop": shop})
     sync_shop_profile(table, shop, token, api_version)
     meta = _shop_row(table, shop) or {}
+    _maybe_auto_activate(table, shop, store_number, token, kms_key_id, api_version, meta)
+    if enqueue_catalog:
+        _enqueue_catalog_sync(shop, store_number, api_version)
+    logger.info("install_bootstrap_complete", extra={"shop": shop, "store_number": store_number})
+
+
+def run_catalog_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:
+    """Async full pull: products then orders (may run long after install activation)."""
+    logger.info(
+        "catalog_sync_start",
+        extra={"shop": shop, "store_number": store_number, "api_version": api_version},
+    )
+    meta = _shop_row(table, shop)
+    if not meta or meta.get("installation_status") != "ACTIVE":
+        logger.info("skip_catalog_sync_not_active", extra={"shop": shop})
+        return
+    enc = meta.get("access_token_enc")
+    if not enc:
+        logger.warning("skip_catalog_sync_no_token", extra={"shop": shop})
+        return
+    token = _shop_admin_token(table, shop, kms_key_id)
     protection_gid = meta.get("protection_product_gid")
-    logger.info("initial_sync_phase", extra={"phase": "products", "shop": shop})
+    logger.info("catalog_sync_phase", extra={"phase": "products", "shop": shop})
     sync_products_initial(table, shop, store_number, token, api_version)
-    logger.info("initial_sync_phase", extra={"phase": "orders", "shop": shop})
+    meta = _shop_row(table, shop) or {}
+    protection_gid = meta.get("protection_product_gid") or protection_gid
+    logger.info("catalog_sync_phase", extra={"phase": "orders", "shop": shop})
     sync_orders(
         table, shop, store_number, token, api_version, protection_product_gid=protection_gid
     )
-    logger.info("initial_sync_complete", extra={"shop": shop, "store_number": store_number})
+    logger.info("catalog_sync_complete", extra={"shop": shop, "store_number": store_number})
+
+
+def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:
+    """Legacy entry: install bootstrap only (catalog sync is enqueued separately)."""
+    run_install_bootstrap(table, shop, store_number, kms_key_id, api_version)
 
 
 def _advance_reconcile_marker(table, shop: str, resource: str) -> None:
@@ -327,6 +584,27 @@ def _execute_webhook_envelope(
             logger.exception("shop_profile_webhook_failed", extra={"shop": shop, "topic": t})
         return
 
+    if t == "markets/delete":
+        try:
+            sync_market_rates_after_profile(
+                table,
+                shop,
+                token,
+                api_version,
+                billing_country=str(meta.get("billing_country_code") or ""),
+            )
+        except Exception:
+            logger.exception("markets_delete_resync_failed", extra={"shop": shop})
+        return
+
+    if t == "products/delete":
+        handle_product_deleted(table, shop, store_number, envelope.get("body") or "")
+        return
+
+    if t == "orders/delete":
+        handle_order_deleted(table, shop, store_number, envelope.get("body") or "")
+        return
+
     if t in ("products/update", "products/create"):
         handle_product_webhook(table, shop, store_number, token, envelope.get("body") or "", api_version)
     elif t in ("orders/create", "orders/updated"):
@@ -375,32 +653,6 @@ def _payload_hash_id(payload: dict[str, Any]) -> str:
     return str(abs(hash(json.dumps(payload, sort_keys=True))))[:18]
 
 
-ONE_PRODUCT_Q = """
-query OneProduct($id: ID!) {
-  product(id: $id) {
-    id
-    updatedAt
-    metafields(first: 50) {
-      edges { node { namespace key type value updatedAt } }
-    }
-    variants(first: 50) {
-      edges {
-        node {
-          id
-          updatedAt
-          price
-          compareAtPrice
-          metafields(first: 30) {
-            edges { node { namespace key type value updatedAt } }
-          }
-        }
-      }
-    }
-  }
-}
-"""
-
-
 def handle_product_webhook(table, shop: str, store_number: str, token: str, raw_body: str, api_version: str) -> None:
     try:
         body = json.loads(raw_body)
@@ -411,33 +663,19 @@ def handle_product_webhook(table, shop: str, store_number: str, token: str, raw_
         pid = f"gid://shopify/Product/{body['id']}"
     if not pid:
         return
-    data = graphql_request(shop, token, ONE_PRODUCT_Q, {"id": pid}, api_version=api_version)
-    if data.get("errors"):
-        logger.warning("product_fetch_errors", extra={"errors": str(data["errors"])[:500]})
+    try:
+        node = fetch_merged_product_node(shop, token, pid, api_version)
+    except Exception as exc:
+        logger.warning("product_fetch_errors", extra={"error": str(exc)[:500], "shop": shop})
         return
-    node = data.get("data", {}).get("product")
     if not node:
+        fake_body = json.dumps({"admin_graphql_api_id": pid})
+        handle_product_deleted(table, shop, store_number, fake_body)
         return
     from lib import product_sync as ps
 
     gid = node["id"]
-    snap = {
-        "gid": gid,
-        "updatedAt": node.get("updatedAt"),
-        "variants": [],
-        "product_metafields": ps._flatten_metafields((node.get("metafields") or {}).get("edges") or []),
-    }
-    for ve in (node.get("variants") or {}).get("edges") or []:
-        vn = ve["node"]
-        snap["variants"].append(
-            {
-                "id": vn["id"],
-                "price": vn.get("price"),
-                "compareAtPrice": vn.get("compareAtPrice"),
-                "updatedAt": vn.get("updatedAt"),
-                "metafields": ps._flatten_metafields((vn.get("metafields") or {}).get("edges") or []),
-            }
-        )
+    snap = product_snapshot_from_graphql(node)
     h = ps._snapshot_hash(snap)
     pk_t = pk_tenant(store_number)
     sk_p = f"PRODUCT#{gid}"
@@ -455,30 +693,11 @@ def handle_product_webhook(table, shop: str, store_number: str, token: str, raw_
             "updated_at_source": node.get("updatedAt"),
             "synced_at": now,
             "shopify_id": gid,
+            "sync_deleted": False,
+            "deleted_at": None,
+            **denorm_product_top_fields(snap),
         }
     )
-
-
-ORDER_ONE_Q = """
-query OrderOne($id: ID!) {
-  order(id: $id) {
-    id
-    legacyResourceId
-    updatedAt
-    name
-    processedAt
-    createdAt
-    lineItems(first: 50) {
-      edges {
-        node {
-          quantity
-          product { id }
-        }
-      }
-    }
-  }
-}
-"""
 
 
 def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, raw_body: str, api_version: str) -> None:
@@ -491,9 +710,13 @@ def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, r
         oid = f"gid://shopify/Order/{body['id']}"
     if not oid:
         return
-    data = graphql_request(shop, token, ORDER_ONE_Q, {"id": oid}, api_version=api_version)
-    node = data.get("data", {}).get("order")
+    try:
+        node = fetch_merged_order_node(shop, token, oid, api_version)
+    except Exception as exc:
+        logger.warning("order_fetch_errors", extra={"error": str(exc)[:500], "shop": shop})
+        return
     if not node:
+        handle_order_deleted(table, shop, store_number, json.dumps({"admin_graphql_api_id": oid}))
         return
     meta = _shop_row(table, shop) or {}
     protection_gid = meta.get("protection_product_gid")
@@ -511,5 +734,8 @@ def handle_order_pull_webhook(table, shop: str, store_number: str, token: str, r
             "shopify_id": gid,
             "has_shipping_protection": has_prot,
             "sync_tags": order_sync_tags(has_prot, protection_gid),
+            "sync_deleted": False,
+            "deleted_at": None,
+            **denorm_order_top_fields(node),
         }
     )

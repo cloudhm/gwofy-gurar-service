@@ -9,29 +9,62 @@ from typing import Any
 
 from .models import pk_tenant
 from .shopify_api import graphql_request
+from .sync_denorm import denorm_product_top_fields
 
-
-PRODUCTS_QUERY = """
+PRODUCTS_LIST_QUERY = """
 query ProductsPage($cursor: String) {
   products(first: 50, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     edges {
       node {
         id
+        handle
+        title
+        status
         updatedAt
-        metafields(first: 50) {
-          edges { node { namespace key type value updatedAt } }
-        }
-        variants(first: 50) {
-          edges {
-            node {
-              id
-              updatedAt
-              price
-              compareAtPrice
-              metafields(first: 30) {
-                edges { node { namespace key type value updatedAt } }
-              }
+      }
+    }
+  }
+}
+"""
+
+PRODUCT_BASE_Q = """
+query ProductBase($id: ID!) {
+  product(id: $id) {
+    id
+    handle
+    title
+    status
+    updatedAt
+    descriptionHtml
+    tags
+  }
+}
+"""
+
+PRODUCT_METAFIELDS_PAGE_Q = """
+query ProductMetafields($id: ID!, $cursor: String) {
+  product(id: $id) {
+    metafields(first: 250, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges { node { namespace key type value updatedAt } }
+    }
+  }
+}
+"""
+
+PRODUCT_MEDIA_PAGE_Q = """
+query ProductMedia($id: ID!, $cursor: String) {
+  product(id: $id) {
+    media(first: 250, after: $cursor, sortKey: POSITION) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          ... on MediaImage {
+            id
+            alt
+            image {
+              url
             }
           }
         }
@@ -41,6 +74,192 @@ query ProductsPage($cursor: String) {
 }
 """
 
+_VARIANT_NODE_FIELDS = """
+              id
+              title
+              sku
+              barcode
+              updatedAt
+              price
+              compareAtPrice
+              inventoryQuantity
+              selectedOptions {
+                name
+                value
+              }
+              image {
+                url
+                altText
+              }
+              metafields(first: 250) {
+                pageInfo { hasNextPage endCursor }
+                edges { node { namespace key type value updatedAt } }
+              }
+"""
+
+PRODUCT_VARIANTS_PAGE_Q = (
+    """
+query ProductVariants($id: ID!, $cursor: String) {
+  product(id: $id) {
+    variants(first: 250, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+"""
+    + _VARIANT_NODE_FIELDS
+    + """
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+VARIANT_METAFIELDS_PAGE_Q = """
+query VariantMetafields($id: ID!, $cursor: String) {
+  node(id: $id) {
+    ... on ProductVariant {
+      metafields(first: 250, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges { node { namespace key type value updatedAt } }
+      }
+    }
+  }
+}
+"""
+
+
+def _raise_if_errors(data: dict[str, Any], ctx: str) -> None:
+    errs = data.get("errors")
+    if errs:
+        raise RuntimeError(f"{ctx}: {errs}")
+
+
+def _paginate_product_metafield_edges(
+    shop: str, token: str, product_gid: str, api_version: str
+) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        data = graphql_request(
+            shop,
+            token,
+            PRODUCT_METAFIELDS_PAGE_Q,
+            {"id": product_gid, "cursor": cursor},
+            api_version=api_version,
+        )
+        _raise_if_errors(data, "product_metafields")
+        conn = ((data.get("data") or {}).get("product") or {}).get("metafields") or {}
+        edges.extend(conn.get("edges") or [])
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor = pi.get("endCursor")
+    return edges
+
+
+def _paginate_product_media_edges(
+    shop: str, token: str, product_gid: str, api_version: str
+) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        data = graphql_request(
+            shop,
+            token,
+            PRODUCT_MEDIA_PAGE_Q,
+            {"id": product_gid, "cursor": cursor},
+            api_version=api_version,
+        )
+        _raise_if_errors(data, "product_media")
+        conn = ((data.get("data") or {}).get("product") or {}).get("media") or {}
+        edges.extend(conn.get("edges") or [])
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor = pi.get("endCursor")
+    return edges
+
+
+def _merge_variant_metafield_pages(
+    shop: str, token: str, variant_gid: str, mf_conn: dict[str, Any], api_version: str
+) -> dict[str, Any]:
+    """Return metafields dict with full edges list (no pageInfo required downstream)."""
+    edges: list[dict[str, Any]] = list((mf_conn or {}).get("edges") or [])
+    pi = (mf_conn or {}).get("pageInfo") or {}
+    cursor = pi.get("endCursor")
+    while pi.get("hasNextPage"):
+        data = graphql_request(
+            shop,
+            token,
+            VARIANT_METAFIELDS_PAGE_Q,
+            {"id": variant_gid, "cursor": cursor},
+            api_version=api_version,
+        )
+        _raise_if_errors(data, "variant_metafields")
+        node = (data.get("data") or {}).get("node") or {}
+        mfc = node.get("metafields") or {}
+        edges.extend(mfc.get("edges") or [])
+        pi = mfc.get("pageInfo") or {}
+        cursor = pi.get("endCursor")
+    return {"edges": edges}
+
+
+def _paginate_product_variant_edges(
+    shop: str, token: str, product_gid: str, api_version: str
+) -> list[dict[str, Any]]:
+    out_edges: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        data = graphql_request(
+            shop,
+            token,
+            PRODUCT_VARIANTS_PAGE_Q,
+            {"id": product_gid, "cursor": cursor},
+            api_version=api_version,
+        )
+        _raise_if_errors(data, "product_variants")
+        conn = ((data.get("data") or {}).get("product") or {}).get("variants") or {}
+        for ve in conn.get("edges") or []:
+            vn = ve.get("node") or {}
+            if not isinstance(vn, dict) or not vn.get("id"):
+                continue
+            mf_root = vn.get("metafields") or {}
+            vn["metafields"] = _merge_variant_metafield_pages(
+                shop, token, vn["id"], mf_root, api_version
+            )
+            out_edges.append({"node": vn})
+        pi = conn.get("pageInfo") or {}
+        if not pi.get("hasNextPage"):
+            break
+        cursor = pi.get("endCursor")
+    return out_edges
+
+
+def fetch_merged_product_node(
+    shop: str, token: str, product_gid: str, api_version: str
+) -> dict[str, Any] | None:
+    """Load one product with all metafields, media, and variants (fully paginated)."""
+    shop_norm = shop.strip().lower().rstrip("/")
+    data = graphql_request(
+        shop_norm, token, PRODUCT_BASE_Q, {"id": product_gid}, api_version=api_version
+    )
+    _raise_if_errors(data, "product_base")
+    base = (data.get("data") or {}).get("product")
+    if not base:
+        return None
+    mf_edges = _paginate_product_metafield_edges(shop_norm, token, product_gid, api_version)
+    media_edges = _paginate_product_media_edges(shop_norm, token, product_gid, api_version)
+    variant_edges = _paginate_product_variant_edges(shop_norm, token, product_gid, api_version)
+    merged: dict[str, Any] = {
+        **base,
+        "metafields": {"edges": mf_edges},
+        "media": {"edges": media_edges},
+        "variants": {"edges": variant_edges},
+    }
+    return merged
+
 
 def _flatten_metafields(edges: list[dict[str, Any]]) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -49,6 +268,82 @@ def _flatten_metafields(edges: list[dict[str, Any]]) -> dict[str, str]:
         k = f"{n.get('namespace','')}:{n.get('key','')}"
         out[k] = str(n.get("value", ""))
     return out
+
+
+def _tags_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for t in raw:
+        if isinstance(t, str) and t.strip():
+            out.append(t)
+    return out
+
+
+def _media_list(node: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for me in (node.get("media") or {}).get("edges") or []:
+        mn = me.get("node") or {}
+        if not isinstance(mn, dict):
+            continue
+        img = mn.get("image") or {}
+        url = img.get("url") if isinstance(img, dict) else None
+        out.append(
+            {
+                "id": mn.get("id"),
+                "url": url,
+                "alt": mn.get("alt"),
+            }
+        )
+    return out
+
+
+def product_snapshot_from_graphql(node: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Admin API product node into the JSON we persist on PRODUCT# rows."""
+    gid = node["id"]
+    variants: list[dict[str, Any]] = []
+    for ve in (node.get("variants") or {}).get("edges") or []:
+        vn = ve.get("node") or {}
+        if not isinstance(vn, dict) or not vn.get("id"):
+            continue
+        vimg = vn.get("image") or {}
+        opts: list[dict[str, str]] = []
+        for so in vn.get("selectedOptions") or []:
+            if isinstance(so, dict):
+                opts.append(
+                    {
+                        "name": str(so.get("name") or ""),
+                        "value": str(so.get("value") or ""),
+                    }
+                )
+        variants.append(
+            {
+                "id": vn["id"],
+                "title": vn.get("title"),
+                "sku": vn.get("sku"),
+                "barcode": vn.get("barcode"),
+                "price": vn.get("price"),
+                "compareAtPrice": vn.get("compareAtPrice"),
+                "updatedAt": vn.get("updatedAt"),
+                "inventoryQuantity": vn.get("inventoryQuantity"),
+                "selected_options": opts,
+                "image_url": vimg.get("url") if isinstance(vimg, dict) else None,
+                "image_alt": vimg.get("altText") if isinstance(vimg, dict) else None,
+                "metafields": _flatten_metafields((vn.get("metafields") or {}).get("edges") or []),
+            }
+        )
+    return {
+        "gid": gid,
+        "handle": node.get("handle"),
+        "title": node.get("title"),
+        "status": node.get("status"),
+        "updatedAt": node.get("updatedAt"),
+        "description_html": node.get("descriptionHtml"),
+        "tags": _tags_list(node.get("tags")),
+        "media": _media_list(node),
+        "variants": variants,
+        "product_metafields": _flatten_metafields((node.get("metafields") or {}).get("edges") or []),
+    }
 
 
 def _snapshot_hash(product: dict[str, Any]) -> str:
@@ -74,9 +369,9 @@ def sync_products_initial(
 
     while True:
         data = graphql_request(
-            shop,
+            shop_norm,
             token,
-            PRODUCTS_QUERY,
+            PRODUCTS_LIST_QUERY,
             {"cursor": cursor},
             api_version=api_version,
         )
@@ -85,29 +380,12 @@ def sync_products_initial(
             raise RuntimeError(f"GraphQL errors: {errors}")
         conn = data["data"]["products"]
         for edge in conn["edges"]:
-            node = edge["node"]
-            gid = node["id"]
-            snap = {
-                "gid": gid,
-                "updatedAt": node.get("updatedAt"),
-                "variants": [],
-                "product_metafields": _flatten_metafields(
-                    (node.get("metafields") or {}).get("edges") or []
-                ),
-            }
-            for ve in (node.get("variants") or {}).get("edges") or []:
-                vn = ve["node"]
-                snap["variants"].append(
-                    {
-                        "id": vn["id"],
-                        "price": vn.get("price"),
-                        "compareAtPrice": vn.get("compareAtPrice"),
-                        "updatedAt": vn.get("updatedAt"),
-                        "metafields": _flatten_metafields(
-                            (vn.get("metafields") or {}).get("edges") or []
-                        ),
-                    }
-                )
+            stub = edge["node"]
+            gid = stub["id"]
+            merged = fetch_merged_product_node(shop_norm, token, gid, api_version)
+            if not merged:
+                continue
+            snap = product_snapshot_from_graphql(merged)
             h = _snapshot_hash(snap)
             pk_t = pk_tenant(store_number)
             sk_p = f"PRODUCT#{gid}"
@@ -124,9 +402,12 @@ def sync_products_initial(
                     "sk": sk_p,
                     "payload": json.dumps(snap, default=str),
                     "snapshot_hash": h,
-                    "updated_at_source": node.get("updatedAt"),
+                    "updated_at_source": merged.get("updatedAt"),
                     "synced_at": now,
                     "shopify_id": gid,
+                    "sync_deleted": False,
+                    "deleted_at": None,
+                    **denorm_product_top_fields(snap),
                 }
             )
 

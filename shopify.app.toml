@@ -8,7 +8,7 @@ embedded = true
 
 [access_scopes]
 # Plan §1b — adjust after Partner Dashboard review (Protected Customer Data, read_all_orders, etc.)
-scopes = "read_users,read_shop,read_products,write_products,read_orders,write_orders,read_markets"
+scopes = "read_users,read_shop,read_products,write_products,read_inventory,read_orders,write_orders,read_markets"
 
 [auth]
 redirect_urls = [
@@ -24,11 +24,11 @@ topics = [ "app/uninstalled" ]
 uri = "/webhooks/shopify"
 
 [[webhooks.subscriptions]]
-topics = [ "products/create", "products/update" ]
+topics = [ "products/create", "products/update", "products/delete" ]
 uri = "/webhooks/shopify"
 
 [[webhooks.subscriptions]]
-topics = [ "orders/create", "orders/updated" ]
+topics = [ "orders/create", "orders/updated", "orders/delete" ]
 uri = "/webhooks/shopify"
 
 [[webhooks.subscriptions]]
@@ -36,7 +36,7 @@ topics = [ "shop/update" ]
 uri = "/webhooks/shopify"
 
 [[webhooks.subscriptions]]
-topics = [ "markets/create", "markets/update" ]
+topics = [ "markets/create", "markets/update", "markets/delete" ]
 uri = "/webhooks/shopify"
 
 [[webhooks.subscriptions]]

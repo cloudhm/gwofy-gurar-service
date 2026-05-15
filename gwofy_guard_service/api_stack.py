@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -29,12 +30,32 @@ from gwofy_guard_service.storage_stack import StorageStack
 
 LAMBDA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lambda"))
 
+# Graviton (ARM64) for all functions in this stack; Docker bundling uses linux/arm64 (native on Apple Silicon).
+_LAMBDA_ARCHITECTURE = aws_lambda.Architecture.ARM_64
+_LAMBDA_DOCKER_PLATFORM = "linux/arm64"
+
 
 @jsii.implements(ILocalBundling)
 class _LocalPipBundle:
-    """Bundle Lambda assets with host `pip` so `cdk synth` works without Docker."""
+    """Bundle Lambda assets with host ``pip`` on Linux **aarch64** so ``cdk synth`` can skip Docker in CI.
+
+    On macOS/Windows, local ``pip`` installs non-Linux wheels; returning ``False`` defers to Docker
+    (``linux/arm64``) and avoids ``Runtime.ImportModuleError: invalid ELF header``.
+
+    Linux **x86_64** hosts also return ``False``: host ``pip`` would install amd64 wheels while these
+    Lambdas run on **ARM_64**. Set ``CDK_FORCE_LAMBDA_DOCKER_BUNDLE=1`` to always use Docker.
+    """
 
     def try_bundle(self, output_dir: str, options: BundlingOptions) -> bool:
+        force_docker = os.environ.get("CDK_FORCE_LAMBDA_DOCKER_BUNDLE", "").strip() in ("1", "true", "yes")
+        machine = platform.machine().lower()
+        use_local_pip = (
+            not force_docker
+            and sys.platform == "linux"
+            and machine in ("aarch64", "arm64")
+        )
+        if not use_local_pip:
+            return False
         subprocess.check_call(
             [
                 sys.executable,
@@ -91,12 +112,14 @@ def _lambda_bundle_code() -> aws_lambda.Code:
         LAMBDA_DIR,
         bundling=BundlingOptions(
             image=aws_lambda.Runtime.PYTHON_3_12.bundling_image,
+            # Match _LAMBDA_ARCHITECTURE (ARM_64). On Apple Silicon this is native; amd64 hosts pull qemu.
+            platform=_LAMBDA_DOCKER_PLATFORM,
             local=_LocalPipBundle(),
             command=[
                 "bash",
                 "-c",
-                "pip install --no-cache-dir -r requirements.txt -t /asset-output "
-                "&& cp -r /asset-input/. /asset-output/",
+                "cp -r /asset-input/. /asset-output/ "
+                "&& pip install --no-cache-dir -r requirements.txt -t /asset-output",
             ],
         ),
     )
@@ -182,6 +205,7 @@ class ApiStack(Stack):
                 self,
                 "CognitoAdminAppClientOnEventFn",
                 runtime=aws_lambda.Runtime.PYTHON_3_12,
+                architecture=_LAMBDA_ARCHITECTURE,
                 handler="cognito_admin_app_client.handler",
                 code=code,
                 timeout=Duration.seconds(120),
@@ -231,6 +255,7 @@ class ApiStack(Stack):
             self,
             "OAuthCallbackFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="oauth_handler.handler",
             code=code,
             timeout=Duration.seconds(60),
@@ -243,6 +268,7 @@ class ApiStack(Stack):
             self,
             "CognitoAuthCallbackFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="cognito_callback_handler.handler",
             code=code,
             timeout=Duration.seconds(29),
@@ -259,6 +285,7 @@ class ApiStack(Stack):
             self,
             "WebhookIngressFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="webhook_handler.handler",
             code=code,
             timeout=Duration.seconds(29),
@@ -274,6 +301,7 @@ class ApiStack(Stack):
             self,
             "WorkerFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="worker_handler.handler",
             code=code,
             timeout=Duration.seconds(900),
@@ -286,6 +314,7 @@ class ApiStack(Stack):
             self,
             "MerchantApiFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="merchant_api_handler.handler",
             code=code,
             timeout=Duration.seconds(120),
@@ -307,6 +336,7 @@ class ApiStack(Stack):
             self,
             "AdminApiFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="admin_handler.handler",
             code=code,
             timeout=Duration.seconds(29),
@@ -319,6 +349,7 @@ class ApiStack(Stack):
             self,
             "ReconciliationFn",
             runtime=aws_lambda.Runtime.PYTHON_3_12,
+            architecture=_LAMBDA_ARCHITECTURE,
             handler="reconciliation_handler.handler",
             code=code,
             timeout=Duration.seconds(120),
@@ -346,6 +377,8 @@ class ApiStack(Stack):
         work_queue.grant_send_messages(reconcile_fn)
         work_queue.grant_send_messages(merchant_fn)
         work_queue.grant_send_messages(webhook_fn)
+        work_queue.grant_send_messages(worker_fn)
+        work_queue.grant_send_messages(admin_fn)
         work_queue.grant_consume_messages(worker_fn)
 
         worker_fn.add_event_source(
@@ -363,14 +396,21 @@ class ApiStack(Stack):
             api_name=f"gwofy-guard-api-{stage}",
             cors_preflight=apigwv2.CorsPreflightOptions(
                 allow_headers=[
+                    "Accept",
                     "Authorization",
                     "Content-Type",
+                    # API Gateway matches literal names; browsers send lowercase on preflight.
                     "X-Shopify-*",
+                    "x-shopify-shop-domain",
+                    "sec-ch-ua",
+                    "sec-ch-ua-mobile",
+                    "sec-ch-ua-platform",
                     "X-Gwofy-Shop",
                     "X-Gwofy-Signature",
                 ],
                 allow_methods=[apigwv2.CorsHttpMethod.ANY],
                 allow_origins=["*"],
+                max_age=Duration.hours(24),
             ),
         )
 
@@ -429,9 +469,19 @@ class ApiStack(Stack):
         )
 
         admin_integ = apigwv2_integrations.HttpLambdaIntegration("AdminInteg", admin_fn)
+        # Do not bind OPTIONS here: JWT authorizer rejects unauthenticated preflight. With CORS
+        # enabled, API Gateway answers OPTIONS when no route matches that method.
+        _admin_methods_no_options = [
+            apigwv2.HttpMethod.GET,
+            apigwv2.HttpMethod.POST,
+            apigwv2.HttpMethod.PUT,
+            apigwv2.HttpMethod.PATCH,
+            apigwv2.HttpMethod.DELETE,
+            apigwv2.HttpMethod.HEAD,
+        ]
         http_api.add_routes(
             path="/admin/{proxy+}",
-            methods=[apigwv2.HttpMethod.ANY],
+            methods=_admin_methods_no_options,
             integration=admin_integ,
             authorizer=admin_jwt,
         )
@@ -439,7 +489,7 @@ class ApiStack(Stack):
         events.Rule(
             self,
             "ReconcileSchedule",
-            schedule=events.Schedule.rate(Duration.minutes(30)),
+            schedule=events.Schedule.rate(Duration.days(1)),
         ).add_target(targets.LambdaFunction(reconcile_fn))
 
         if custom_domain_fqdn and custom_domain_certificate_arn:

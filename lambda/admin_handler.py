@@ -51,11 +51,13 @@ from lib.kms_tokens import decrypt_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
 from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.admin_shop_sync import normalize_resources, run_admin_shop_sync
 from lib.shopify_api import DEFAULT_API_VERSION
 
 logger = setup_logging("admin")
 
 ddb = boto3.resource("dynamodb")
+sqs = boto3.client("sqs")
 
 
 def _claims(event) -> dict[str, Any]:
@@ -171,7 +173,7 @@ def handler(event, context):
     if method == "GET" and len(parts) == 4 and parts[3] == "detail":
         return _get_shop_detail(table, shop, actor_sub, req_id)
     if method == "GET" and len(parts) == 4 and parts[3] == "products":
-        return _list_products(table, shop, actor_sub, req_id)
+        return _list_products(event, table, shop, actor_sub, req_id)
     if method == "GET" and len(parts) == 4 and parts[3] == "orders":
         return _list_orders(event, table, shop, actor_sub, req_id)
     if method == "GET" and len(parts) == 4 and parts[3] == "audit":
@@ -182,6 +184,9 @@ def handler(event, context):
 
     if method == "POST" and len(parts) == 4 and parts[3] == "sync-enabled-currencies":
         return _post_admin_sync_shop_currencies(event, table, shop, actor_sub, actor_email, req_id)
+
+    if method == "POST" and len(parts) == 4 and parts[3] == "sync":
+        return _post_admin_shop_sync(event, table, shop, actor_sub, actor_email, req_id)
 
     if method == "GET" and len(parts) == 4 and parts[3] == "calc-coverage-tips":
         return _get_shop_calc_coverage_tips(table, shop, actor_sub, req_id)
@@ -608,6 +613,153 @@ def _post_admin_sync_shop_currencies(event, table, shop: str, actor_sub: str, ac
     return _resp(200, {"ok": True, "currencies": codes})
 
 
+def _post_admin_shop_sync(
+    event, table, shop: str, actor_sub: str, actor_email: str, req_id: str
+):
+    """
+    POST /admin/shops/{shop}/sync
+    Body: {
+      "resources": ["all"] | ["shop_profile","products","orders","currencies","markets","catalog"],
+      "async": true,           // default true — enqueue Worker (recommended for products/orders)
+      "reset_checkpoints": false  // if true, restart full product/order pagination from scratch
+    }
+    """
+    meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    if meta.get("installation_status") != "ACTIVE":
+        return _resp(400, {"error": "shop_not_active"})
+    if meta.get("plugin_suspended"):
+        return _resp(403, {"error": "plugin_suspended"})
+    enc = meta.get("access_token_enc")
+    if not enc:
+        return _resp(400, {"error": "missing_access_token"})
+    store_number = str(meta.get("store_number") or "")
+    if not store_number:
+        return _resp(400, {"error": "missing_store_number"})
+
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body_must_be_object"})
+
+    raw_resources = body.get("resources")
+    if raw_resources is None:
+        raw_resources = ["all"]
+    if isinstance(raw_resources, str):
+        raw_resources = [raw_resources]
+    if not isinstance(raw_resources, list) or not raw_resources:
+        return _resp(400, {"error": "resources_required", "hint": 'e.g. ["all"] or ["products","orders"]'})
+
+    try:
+        normalized = normalize_resources([str(x) for x in raw_resources])
+    except ValueError as e:
+        code = str(e)
+        if code.startswith("unknown_resource:"):
+            return _resp(400, {"error": "unknown_resource", "detail": code.split(":", 1)[-1]})
+        return _resp(400, {"error": "invalid_resources", "detail": code})
+
+    reset_cp = bool(body.get("reset_checkpoints"))
+    use_async = body.get("async")
+    if use_async is None:
+        use_async = True
+    else:
+        use_async = bool(use_async)
+
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    http_path = f"/admin/shops/{shop}/sync"
+
+    if use_async:
+        q = os.environ.get("WORK_QUEUE_URL")
+        if not q:
+            return _resp(503, {"error": "work_queue_not_configured"})
+        msg = {
+            "source": "admin_api",
+            "shop": shop,
+            "store_number": store_number,
+            "resources": normalized,
+            "reset_checkpoints": reset_cp,
+            "api_version": api_version,
+            "requested_by": actor_sub,
+        }
+        r = sqs.send_message(QueueUrl=q, MessageBody=json.dumps(msg))
+        append_audit(
+            table,
+            shop,
+            actor_type="admin",
+            actor_id=actor_sub,
+            action="ADMIN_SHOP_SYNC_ENQUEUE",
+            outcome="ok",
+            resource=",".join(normalized),
+            actor_email=actor_email or None,
+            detail={"async": True, "reset_checkpoints": reset_cp},
+            http_path=http_path,
+            request_id=req_id,
+        )
+        return _resp(
+            202,
+            {
+                "ok": True,
+                "async": True,
+                "shop": shop,
+                "resources": normalized,
+                "reset_checkpoints": reset_cp,
+                "sqs_message_id": r.get("MessageId"),
+            },
+        )
+
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    try:
+        token = get_fresh_shop_access_token(
+            table,
+            shop,
+            kms_key_id_fallback=kms_key_id,
+            client_id=os.environ["SHOPIFY_CLIENT_ID"],
+            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+            meta=meta,
+        )
+    except Exception as e:
+        return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
+
+    try:
+        result = run_admin_shop_sync(
+            table,
+            shop,
+            store_number,
+            token,
+            kms_key_id,
+            api_version,
+            normalized,
+            reset_checkpoints=reset_cp,
+        )
+    except ValueError as e:
+        err = str(e)
+        if err == "shop_not_active":
+            return _resp(400, {"error": err})
+        if err == "missing_access_token":
+            return _resp(400, {"error": err})
+        return _resp(400, {"error": "sync_failed", "detail": err})
+
+    outcome = "ok" if result.get("ok") else "partial_error"
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_SHOP_SYNC",
+        outcome=outcome,
+        resource=",".join(normalized),
+        actor_email=actor_email or None,
+        detail={"async": False, "steps": list((result.get("steps") or {}).keys())},
+        http_path=http_path,
+        request_id=req_id,
+    )
+    status = 200 if result.get("ok") else 502
+    return _resp(status, {**result, "async": False})
+
+
 def _put_shipping_calc(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
@@ -778,37 +930,90 @@ def _get_shop_detail(table, shop: str, actor_sub: str, req_id: str):
     return _resp(200, payload)
 
 
-def _list_products(table, shop: str, actor_sub: str, req_id: str):
+def _is_primary_product_mirror_sk(sk: str) -> bool:
+    """Main product snapshot rows only (exclude PRODUCT#...#META_VER# history)."""
+    s = str(sk or "")
+    return s.startswith("PRODUCT#") and "#META_VER#" not in s
+
+
+def _list_products(event, table, shop: str, actor_sub: str, req_id: str):
+    qs = event.get("queryStringParameters") or {}
+    include_deleted = (qs.get("include_deleted") or "").lower() in ("1", "true", "yes")
+    limit = min(int(qs.get("limit") or 100), 500)
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
         return _resp(404, {"error": "not_found"})
     sn = str(meta.get("store_number", ""))
     pk_t = pk_tenant(sn)
-    resp = table.query(
-        KeyConditionExpression="pk = :p AND begins_with(sk, :pre)",
-        ExpressionAttributeValues={":p": pk_t, ":pre": "PRODUCT#"},
-        Limit=100,
-    )
-    return _resp(200, {"items": resp.get("Items", [])})
+    names: dict[str, str] = {}
+    vals: dict[str, Any] = {":p": pk_t, ":pre": "PRODUCT#"}
+    filt: list[str] = []
+    if not include_deleted:
+        names["#sd"] = "sync_deleted"
+        filt.append("(attribute_not_exists(#sd) OR #sd = :fv)")
+        vals[":fv"] = False
+    if prefix := (qs.get("product_handle_prefix") or "").strip():
+        filt.append("begins_with(product_handle, :hpre)")
+        vals[":hpre"] = prefix
+    if pst := (qs.get("product_status") or "").strip():
+        filt.append("product_status = :pst")
+        vals[":pst"] = pst.upper()
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "pk = :p AND begins_with(sk, :pre)",
+        "ExpressionAttributeValues": vals,
+        # Over-fetch; exclude META_VER rows in memory (sk cannot appear in FilterExpression).
+        "Limit": min(limit * 3, 500),
+    }
+    if filt:
+        kwargs["FilterExpression"] = " AND ".join(filt)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    resp = table.query(**kwargs)
+    items = [
+        x
+        for x in resp.get("Items", [])
+        if _is_primary_product_mirror_sk(str(x.get("sk") or ""))
+    ][:limit]
+    return _resp(200, {"items": items})
 
 
 def _list_orders(event, table, shop: str, actor_sub: str, req_id: str):
     qs = event.get("queryStringParameters") or {}
     only_prot = (qs.get("only_protection") or "").lower() in ("1", "true", "yes")
+    include_deleted = (qs.get("include_deleted") or "").lower() in ("1", "true", "yes")
     tag_filter = (qs.get("tag") or "").strip()
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
         return _resp(404, {"error": "not_found"})
     sn = str(meta.get("store_number", ""))
     pk_t = pk_tenant(sn)
-    resp = table.query(
-        KeyConditionExpression="pk = :p AND begins_with(sk, :pre)",
-        ExpressionAttributeValues={":p": pk_t, ":pre": "ORDER#"},
-        Limit=100,
-    )
-    items = resp.get("Items", [])
+    names: dict[str, str] = {}
+    vals: dict[str, Any] = {":p": pk_t, ":pre": "ORDER#"}
+    filt: list[str] = []
+    if not include_deleted:
+        names["#sd"] = "sync_deleted"
+        filt.append("(attribute_not_exists(#sd) OR #sd = :fv)")
+        vals[":fv"] = False
     if only_prot:
-        items = [x for x in items if x.get("has_shipping_protection")]
+        filt.append("has_shipping_protection = :hp")
+        vals[":hp"] = True
+    if fs := (qs.get("financial_status") or "").strip():
+        filt.append("display_financial_status = :dfs")
+        vals[":dfs"] = fs.upper()
+    if onp := (qs.get("order_name_prefix") or "").strip():
+        filt.append("begins_with(order_name, :onp)")
+        vals[":onp"] = onp
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "pk = :p AND begins_with(sk, :pre)",
+        "ExpressionAttributeValues": vals,
+        "Limit": min(int(qs.get("limit") or 100), 500),
+    }
+    if filt:
+        kwargs["FilterExpression"] = " AND ".join(filt)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    resp = table.query(**kwargs)
+    items = resp.get("Items", [])
     if tag_filter:
         items = [x for x in items if tag_filter in (x.get("sync_tags") or [])]
     return _resp(200, {"items": items})

@@ -130,8 +130,8 @@ def handler(event, context):
         "store_number": store_number,
         "api_version": api_version,
     }
-    # APP_INSTALLED first so the worker can notify (e.g. Feishu) before long INITIAL_SYNC;
-    # INITIAL_SYNC failures must not block install notification (see SqsEventSource partial batch).
+    # APP_INSTALLED first so the worker can notify (e.g. Feishu) before INITIAL_SYNC;
+    # INITIAL_SYNC enqueues CATALOG_SYNC after profile + activation (async product/order pull).
     r_installed = sqs.send_message(
         QueueUrl=queue_url,
         MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),

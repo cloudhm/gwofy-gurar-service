@@ -1,4 +1,4 @@
-"""Scheduled reconciliation — enqueue GraphQL refresh per ACTIVE shop (§1g)."""
+"""Scheduled reconciliation — enqueue GraphQL refresh per ACTIVE shop once per day (§1g)."""
 
 from __future__ import annotations
 
