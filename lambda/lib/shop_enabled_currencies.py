@@ -9,7 +9,7 @@ from typing import Any
 
 from .models import SK_METADATA, pk_shop
 from .pricing_currencies import ALLOWED_PRICING_CURRENCIES, normalize_currency_code
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +77,20 @@ def sync_shop_enabled_currencies(
     api_version: str,
     *,
     fallback_primary: str | None = None,
+    auth: ShopAdminAuth | None = None,
 ) -> list[str]:
     """Fetch enabled currencies from Shopify and persist to METADATA. Returns sorted list."""
     shop_norm = shop.strip().lower().rstrip("/")
     try:
-        data = graphql_request(shop_norm, token, CURRENCY_QUERY, {}, api_version=api_version)
+        data = shop_admin_graphql_call(
+            shop_norm,
+            token,
+            CURRENCY_QUERY,
+            {},
+            api_version,
+            auth=auth,
+            operation="shopEnabledCurrencies",
+        )
         if data.get("errors"):
             raise RuntimeError(str(data.get("errors")))
         codes = _collect_from_graphql_payload(data)

@@ -16,6 +16,7 @@ from .pricing_config import (
     tier_native_amount,
 )
 from .protection_product import upsert_protection_product
+from .shop_offline_access import ShopAdminAuth
 
 DEFAULT_TITLE = "Shipping Protection"
 DEFAULT_TYPE = "shipping-protection"
@@ -60,6 +61,7 @@ def run_activate_app(
     api_version: str,
     *,
     actor_sub: str = "",
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     shop_norm = shop.strip().lower().rstrip("/")
     meta = table.get_item(Key={"pk": pk_shop(shop_norm), "sk": SK_METADATA}).get("Item") or {}
@@ -112,6 +114,7 @@ def run_activate_app(
         vendor=PROTECTION_PRODUCT_VENDOR,
         product_type=DEFAULT_TYPE,
         handle=PROTECTION_PRODUCT_HANDLE,
+        auth=auth,
     )
     now = datetime.now(timezone.utc).isoformat()
     table.update_item(
@@ -147,6 +150,7 @@ def run_activate_app_safe(
     api_version: str,
     *,
     actor_sub: str = "",
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     shop_norm = shop.strip().lower().rstrip("/")
     try:
@@ -158,6 +162,7 @@ def run_activate_app_safe(
             kms_key_id,
             api_version,
             actor_sub=actor_sub,
+            auth=auth,
         )
     except ActivateAppError as e:
         now = datetime.now(timezone.utc).isoformat()

@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from .pricing_resolve import format_money
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 
 PRODUCT_CREATE = """
 mutation ProductCreate($product: ProductCreateInput!) {
@@ -97,8 +97,19 @@ query ProductsByHandle($q: String!) {
 }
 """
 
-# Raised when first activation finds another product already using our fixed handle.
-PROTECTION_HANDLE_ALREADY_EXISTS = "protection_handle_already_exists"
+def _protection_gql(
+    shop: str,
+    token: str,
+    query: str,
+    variables: dict[str, Any] | None,
+    api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
+    operation: str = "protectionProduct",
+) -> dict[str, Any]:
+    return shop_admin_graphql_call(
+        shop, token, query, variables or {}, api_version, auth=auth, operation=operation
+    )
 
 
 def _err(data: dict[str, Any], key: str) -> None:
@@ -108,13 +119,12 @@ def _err(data: dict[str, Any], key: str) -> None:
         raise RuntimeError(f"shopify_user_errors:{errs}")
 
 
-def _list_all_variant_nodes(shop: str, token: str, product_gid: str, api_version: str) -> list[dict[str, Any]]:
+def _list_all_variant_nodes(shop: str, token: str, product_gid: str, api_version: str, *, auth: ShopAdminAuth | None = None) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     cursor = None
     while True:
-        data = graphql_request(
-            shop, token, PRODUCT_QUERY_VARIANTS, {"id": product_gid, "cursor": cursor}, api_version=api_version
-        )
+        data = _protection_gql(
+            shop, token, PRODUCT_QUERY_VARIANTS, {"id": product_gid, "cursor": cursor}, api_version, auth=auth)
         if data.get("errors"):
             raise RuntimeError(str(data["errors"]))
         p = data.get("data", {}).get("product") or {}
@@ -135,9 +145,9 @@ def _plan_value_from_variant(node: dict[str, Any]) -> str | None:
     return None
 
 
-def _product_id_exists(shop: str, token: str, api_version: str, product_gid: str) -> bool:
-    data = graphql_request(
-        shop, token, PRODUCT_BY_ID_EXISTS, {"id": product_gid}, api_version=api_version
+def _product_id_exists(shop: str, token: str, api_version: str, product_gid: str, *, auth: ShopAdminAuth | None = None) -> bool:
+    data = _protection_gql(
+        shop, token, PRODUCT_BY_ID_EXISTS, {"id": product_gid}, api_version, auth=auth
     )
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
@@ -146,14 +156,14 @@ def _product_id_exists(shop: str, token: str, api_version: str, product_gid: str
 
 
 def _first_product_gid_by_handle(
-    shop: str, token: str, api_version: str, handle: str
+    shop: str, token: str, api_version: str, handle: str, *, auth: ShopAdminAuth | None = None
 ) -> str | None:
     """Admin search `handle:<value>`; returns first matching product GID."""
     h = (handle or "").strip()
     if not h:
         return None
     q = f"handle:{h}"
-    data = graphql_request(shop, token, PRODUCTS_BY_HANDLE, {"q": q}, api_version=api_version)
+    data = _protection_gql(shop, token, PRODUCTS_BY_HANDLE, {"q": q}, api_version, auth=auth)
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
     edges = (data.get("data", {}).get("products") or {}).get("edges") or []
@@ -175,15 +185,16 @@ def _sync_product_vendor(
     api_version: str,
     product_gid: str,
     vendor: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     """Ensure product-level vendor on existing protection product (Shopify Admin GraphQL)."""
-    data = graphql_request(
+    data = _protection_gql(
         shop,
         token,
         PRODUCT_UPDATE,
         {"product": {"id": product_gid, "vendor": vendor}},
-        api_version=api_version,
-    )
+        api_version, auth=auth)
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
     _err(data, "productUpdate")
@@ -211,6 +222,8 @@ def _create_new_protection_product(
     vendor: str,
     product_type: str,
     handle: str | None,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> str:
     """
     Shopify 2025+ productCreate: ProductCreateInput no longer accepts `variants`.
@@ -230,7 +243,7 @@ def _create_new_protection_product(
     if handle:
         product_input["handle"] = handle
 
-    data = graphql_request(shop, token, PRODUCT_CREATE, {"product": product_input}, api_version=api_version)
+    data = _protection_gql(shop, token, PRODUCT_CREATE, {"product": product_input}, api_version, auth=auth)
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
     _err(data, "productCreate")
@@ -244,30 +257,29 @@ def _create_new_protection_product(
     rest = tiers_shop[1:]
     nodes = (product.get("variants") or {}).get("nodes") or []
     if not nodes:
-        nodes = _list_all_variant_nodes(shop, token, pid, api_version)
+        nodes = _list_all_variant_nodes(shop, token, pid, api_version, auth=auth)
 
     if nodes:
         default_vid = str(nodes[0]["id"])
         update_row = _variant_bulk_input(first_code, first_price, first_sku, variant_id=default_vid)
-        data_u = graphql_request(
+        data_u = _protection_gql(
             shop,
             token,
             PRODUCT_VARIANTS_BULK_UPDATE,
             {"productId": pid, "variants": [update_row]},
-            api_version=api_version,
-        )
+            api_version, auth=auth)
         if data_u.get("errors"):
             raise RuntimeError(str(data_u["errors"]))
         _err(data_u, "productVariantsBulkUpdate")
     elif rest:
         # No default variant returned — create all tiers via bulk create.
-        _bulk_create_chunks(shop, token, api_version, pid, tiers_shop)
+        _bulk_create_chunks(shop, token, api_version, pid, tiers_shop, auth=auth)
         return pid
     else:
         raise RuntimeError("product_create_no_default_variant")
 
     if rest:
-        _bulk_create_chunks(shop, token, api_version, pid, rest)
+        _bulk_create_chunks(shop, token, api_version, pid, rest, auth=auth)
     return pid
 
 
@@ -278,10 +290,12 @@ def _apply_tiers_to_existing_product(
     pid: str,
     tiers_shop: list[tuple[str, Decimal, str]],
     vendor: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> str:
-    _sync_product_vendor(shop, token, api_version, pid, vendor)
+    _sync_product_vendor(shop, token, api_version, pid, vendor, auth=auth)
     want: dict[str, tuple[Decimal, str]] = {c: (p, s) for c, p, s in tiers_shop}
-    nodes = _list_all_variant_nodes(shop, token, pid, api_version)
+    nodes = _list_all_variant_nodes(shop, token, pid, api_version, auth=auth)
     by_plan: dict[str, str] = {}
     for n in nodes:
         pv = _plan_value_from_variant(n)
@@ -302,24 +316,22 @@ def _apply_tiers_to_existing_product(
     if updates:
         for i in range(0, len(updates), 50):
             chunk = updates[i : i + 50]
-            data = graphql_request(
-                shop, token, PRODUCT_VARIANTS_BULK_UPDATE, {"productId": pid, "variants": chunk}, api_version=api_version
-            )
+            data = _protection_gql(
+                shop, token, PRODUCT_VARIANTS_BULK_UPDATE, {"productId": pid, "variants": chunk}, api_version, auth=auth)
             if data.get("errors"):
                 raise RuntimeError(str(data["errors"]))
             _err(data, "productVariantsBulkUpdate")
 
     missing = [(c, p, s) for c, p, s in tiers_shop if c not in by_plan]
     if missing:
-        _bulk_create_chunks(shop, token, api_version, pid, missing)
+        _bulk_create_chunks(shop, token, api_version, pid, missing, auth=auth)
 
     obsolete_ids = [vid for plan, vid in by_plan.items() if plan not in want]
     if obsolete_ids:
         for i in range(0, len(obsolete_ids), 50):
             chunk = obsolete_ids[i : i + 50]
-            data = graphql_request(
-                shop, token, PRODUCT_VARIANTS_BULK_DELETE, {"productId": pid, "variantsIds": chunk}, api_version=api_version
-            )
+            data = _protection_gql(
+                shop, token, PRODUCT_VARIANTS_BULK_DELETE, {"productId": pid, "variantsIds": chunk}, api_version, auth=auth)
             if data.get("errors"):
                 raise RuntimeError(str(data["errors"]))
             _err(data, "productVariantsBulkDelete")
@@ -338,38 +350,27 @@ def upsert_protection_product(
     vendor: str,
     product_type: str,
     handle: str | None = None,
+    auth: ShopAdminAuth | None = None,
 ) -> str:
     """
     tiers_shop: (plan_code, price in shop currency, inventory SKU per variant).
     Returns product GID.
 
-    - First activation (no saved gid): if `handle` is already used by a product →
-      raise RuntimeError(PROTECTION_HANDLE_ALREADY_EXISTS).
-    - Reactivation (saved gid present): if saved product was deleted, resolve by
-      `handle` and update that product; if none with handle, create a new product.
+    Resolve existing product by saved gid, else by fixed handle (first activation
+    adopts and overwrites), else create a new product.
     """
     shop = shop.strip().lower().rstrip("/")
     saved_gid = (existing_product_gid or "").strip() or None
     fixed_handle = (handle or "").strip() or None
 
     resolved_pid: str | None = None
-    if saved_gid:
-        if _product_id_exists(shop, token, api_version, saved_gid):
-            resolved_pid = saved_gid
-        elif fixed_handle:
-            resolved_pid = _first_product_gid_by_handle(shop, token, api_version, fixed_handle)
+    if saved_gid and _product_id_exists(shop, token, api_version, saved_gid, auth=auth):
+        resolved_pid = saved_gid
+    if not resolved_pid and fixed_handle:
+        resolved_pid = _first_product_gid_by_handle(shop, token, api_version, fixed_handle, auth=auth)
 
     if resolved_pid:
-        return _apply_tiers_to_existing_product(shop, token, api_version, resolved_pid, tiers_shop, vendor)
-
-    # Create path
-    if not saved_gid:
-        # First activation — refuse if another listing already owns our handle.
-        if fixed_handle:
-            conflict = _first_product_gid_by_handle(shop, token, api_version, fixed_handle)
-            if conflict:
-                raise RuntimeError(PROTECTION_HANDLE_ALREADY_EXISTS)
-    # Reactivation after delete (saved_gid was set but product gone; handle search empty): create
+        return _apply_tiers_to_existing_product(shop, token, api_version, resolved_pid, tiers_shop, vendor, auth=auth)
 
     return _create_new_protection_product(
         shop,
@@ -380,6 +381,7 @@ def upsert_protection_product(
         vendor,
         product_type,
         fixed_handle,
+        auth=auth,
     )
 
 
@@ -390,13 +392,14 @@ def _bulk_create_chunks(
     product_gid: str,
     tiers: list[tuple[str, Decimal, str]],
     chunk_size: int = 50,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     for i in range(0, len(tiers), chunk_size):
         chunk = tiers[i : i + chunk_size]
         variants = [_variant_bulk_input(code, price, sku) for code, price, sku in chunk]
-        data = graphql_request(
-            shop, token, PRODUCT_VARIANTS_BULK_CREATE, {"productId": product_gid, "variants": variants}, api_version=api_version
-        )
+        data = _protection_gql(
+            shop, token, PRODUCT_VARIANTS_BULK_CREATE, {"productId": product_gid, "variants": variants}, api_version, auth=auth)
         if data.get("errors"):
             raise RuntimeError(str(data["errors"]))
         _err(data, "productVariantsBulkCreate")

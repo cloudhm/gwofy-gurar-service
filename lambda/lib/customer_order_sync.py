@@ -8,7 +8,7 @@ from typing import Any
 
 from .models import pk_tenant
 from .order_protection import order_has_protection_product
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 from .sync_denorm import denorm_order_top_fields
 from .sync_order_tags import order_sync_tags
 
@@ -142,7 +142,12 @@ def _raise_if_errors(data: dict[str, Any], ctx: str) -> None:
 
 
 def merge_order_all_line_items(
-    shop: str, token: str, order_head: dict[str, Any], api_version: str
+    shop: str,
+    token: str,
+    order_head: dict[str, Any],
+    api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> dict[str, Any]:
     """Attach all line items (paginated) to an order node that has header fields only."""
     shop_norm = shop.strip().lower().rstrip("/")
@@ -151,12 +156,14 @@ def merge_order_all_line_items(
     edges: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop_norm,
             token,
             ORDER_LINES_PAGE_Q,
             {"id": oid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="orderLineItems",
         )
         _raise_if_errors(data, "order_line_items")
         conn = ((data.get("data") or {}).get("order") or {}).get("lineItems") or {}
@@ -170,18 +177,29 @@ def merge_order_all_line_items(
 
 
 def fetch_merged_order_node(
-    shop: str, token: str, order_gid: str, api_version: str
+    shop: str,
+    token: str,
+    order_gid: str,
+    api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> dict[str, Any] | None:
     """Load order header + every line item page (e.g. webhook refresh)."""
     shop_norm = shop.strip().lower().rstrip("/")
-    data = graphql_request(
-        shop_norm, token, ORDER_HEAD_Q, {"id": order_gid}, api_version=api_version
+    data = shop_admin_graphql_call(
+        shop_norm,
+        token,
+        ORDER_HEAD_Q,
+        {"id": order_gid},
+        api_version,
+        auth=auth,
+        operation="orderHead",
     )
     _raise_if_errors(data, "order_head")
     head = (data.get("data") or {}).get("order")
     if not head:
         return None
-    return merge_order_all_line_items(shop_norm, token, head, api_version)
+    return merge_order_all_line_items(shop_norm, token, head, api_version, auth=auth)
 
 
 def sync_orders(
@@ -191,6 +209,8 @@ def sync_orders(
     token: str,
     api_version: str,
     protection_product_gid: str | None = None,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     shop_norm = shop.strip().lower().rstrip("/")
     sync_pk = f"SYNC#{shop_norm}"
@@ -202,14 +222,22 @@ def sync_orders(
     pk_t = pk_tenant(store_number)
     while True:
         now = datetime.now(timezone.utc).isoformat()
-        data = graphql_request(shop_norm, token, ORDERS_Q, {"cursor": cursor}, api_version=api_version)
+        data = shop_admin_graphql_call(
+            shop_norm,
+            token,
+            ORDERS_Q,
+            {"cursor": cursor},
+            api_version,
+            auth=auth,
+            operation="orders",
+        )
         if data.get("errors"):
             raise RuntimeError(str(data["errors"]))
         conn = data["data"]["orders"]
         for edge in conn["edges"]:
             head = edge["node"]
             gid = head["id"]
-            n = merge_order_all_line_items(shop_norm, token, head, api_version)
+            n = merge_order_all_line_items(shop_norm, token, head, api_version, auth=auth)
             has_prot = order_has_protection_product(n, protection_product_gid)
             table.put_item(
                 Item={

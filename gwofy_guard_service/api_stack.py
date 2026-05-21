@@ -370,7 +370,8 @@ class ApiStack(Stack):
 
         token_key.grant_encrypt_decrypt(oauth_fn)
         token_key.grant_decrypt(worker_fn)
-        token_key.grant_decrypt(merchant_fn)
+        # Session-token offline recovery persists new access/refresh tokens via KMS encrypt.
+        token_key.grant_encrypt_decrypt(merchant_fn)
         token_key.grant_decrypt(admin_fn)
 
         work_queue.grant_send_messages(oauth_fn)

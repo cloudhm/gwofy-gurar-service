@@ -16,7 +16,7 @@ from lib.customer_order_sync import fetch_merged_order_node, sync_orders
 from lib.feishu import send_text
 from lib.logging_json import setup_logging
 from lib.models import SK_METADATA, SK_WEBHOOK_PROCESSED, pk_shop, pk_tenant, pk_webhook
-from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.shop_offline_access import ShopAdminAuth, get_fresh_shop_access_token
 from lib.shop_archive import archive_and_delete_shop
 from lib.activity_config import ensure_activity_info_seed
 from lib.calc_coverage_tips_config import ensure_calc_coverage_tips_seed
@@ -43,14 +43,22 @@ sqs = boto3.client("sqs")
 kms_key_id_env = None
 
 
-def _shop_admin_token(table, shop: str, kms_key_id: str) -> str:
-    return get_fresh_shop_access_token(
+def _shop_admin_auth(
+    table, shop: str, kms_key_id: str, api_version: str | None = None
+) -> ShopAdminAuth:
+    ver = api_version or os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    return ShopAdminAuth(
         table,
-        shop,
-        kms_key_id_fallback=kms_key_id,
-        client_id=os.environ["SHOPIFY_CLIENT_ID"],
-        client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+        shop.strip().lower().rstrip("/"),
+        kms_key_id,
+        os.environ["SHOPIFY_CLIENT_ID"],
+        os.environ["SHOPIFY_CLIENT_SECRET"],
+        ver,
     )
+
+
+def _shop_admin_token(table, shop: str, kms_key_id: str) -> str:
+    return _shop_admin_auth(table, shop, kms_key_id).access_token()
 
 
 def _sqs_record_audit(record: dict[str, Any]) -> dict[str, Any]:
@@ -194,10 +202,11 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
         enc = meta.get("access_token_enc")
         if not enc:
             return
-        token = _shop_admin_token(table, shop, kms_key_id)
         ver = body.get("api_version") or api_version
+        auth = _shop_admin_auth(table, shop, kms_key_id, ver)
+        token = auth.access_token()
         if ev == "SHOP_PROFILE_SYNC":
-            sync_shop_profile(table, shop, token, ver)
+            sync_shop_profile(table, shop, token, ver, auth=auth)
             return
         logger.warning("unknown_merchant_event", extra={"event": ev})
         return
@@ -373,6 +382,8 @@ def _maybe_auto_activate(
     kms_key_id: str,
     api_version: str,
     meta: dict[str, Any],
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     """After install profile sync, create/update Shipping Protection product if not yet activated."""
     if str(meta.get("activation_status") or "") == "ACTIVATED":
@@ -388,6 +399,7 @@ def _maybe_auto_activate(
             kms_key_id,
             api_version,
             actor_sub="initial_sync",
+            auth=auth,
         )
         logger.info("auto_activate_success", extra={"shop": shop, "store_number": store_number})
     except ActivateAppError as e:
@@ -469,13 +481,16 @@ def run_install_bootstrap(
     if not enc:
         logger.warning("skip_sync_no_token", extra={"shop": shop})
         return
-    token = _shop_admin_token(table, shop, kms_key_id)
+    auth = _shop_admin_auth(table, shop, kms_key_id, api_version)
+    token = auth.access_token()
     table_name = os.environ["TABLE_NAME"]
     _ensure_global_config_seeds(table_name)
     logger.info("install_bootstrap_phase", extra={"phase": "shop_profile", "shop": shop})
-    sync_shop_profile(table, shop, token, api_version)
+    sync_shop_profile(table, shop, token, api_version, auth=auth)
     meta = _shop_row(table, shop) or {}
-    _maybe_auto_activate(table, shop, store_number, token, kms_key_id, api_version, meta)
+    _maybe_auto_activate(
+        table, shop, store_number, token, kms_key_id, api_version, meta, auth=auth
+    )
     if enqueue_catalog:
         _enqueue_catalog_sync(shop, store_number, api_version)
     if enqueue_themes:
@@ -497,15 +512,22 @@ def run_catalog_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
     if not enc:
         logger.warning("skip_catalog_sync_no_token", extra={"shop": shop})
         return
-    token = _shop_admin_token(table, shop, kms_key_id)
+    auth = _shop_admin_auth(table, shop, kms_key_id, api_version)
+    token = auth.access_token()
     protection_gid = meta.get("protection_product_gid")
     logger.info("catalog_sync_phase", extra={"phase": "products", "shop": shop})
-    sync_products_initial(table, shop, store_number, token, api_version)
+    sync_products_initial(table, shop, store_number, token, api_version, auth=auth)
     meta = _shop_row(table, shop) or {}
     protection_gid = meta.get("protection_product_gid") or protection_gid
     logger.info("catalog_sync_phase", extra={"phase": "orders", "shop": shop})
     sync_orders(
-        table, shop, store_number, token, api_version, protection_product_gid=protection_gid
+        table,
+        shop,
+        store_number,
+        token,
+        api_version,
+        protection_product_gid=protection_gid,
+        auth=auth,
     )
     logger.info("catalog_sync_complete", extra={"shop": shop, "store_number": store_number})
 
@@ -524,9 +546,10 @@ def run_theme_sync(table, shop: str, store_number: str, kms_key_id: str, api_ver
     if not enc:
         logger.warning("skip_theme_sync_no_token", extra={"shop": shop})
         return
-    token = _shop_admin_token(table, shop, kms_key_id)
+    auth = _shop_admin_auth(table, shop, kms_key_id, api_version)
+    token = auth.access_token()
     try:
-        sync_themes_full(table, shop, token, api_version)
+        sync_themes_full(table, shop, token, api_version, auth=auth)
     except Exception:
         logger.warning("theme_sync_failed", extra={"shop": shop}, exc_info=True)
         return
@@ -623,11 +646,12 @@ def _execute_webhook_envelope(
     store_number = str(meta.get("store_number", ""))
     if not enc:
         return
-    token = _shop_admin_token(table, shop, kms_key_id)
+    auth = _shop_admin_auth(table, shop, kms_key_id, api_version)
+    token = auth.access_token()
 
     if t in ("shop/update", "markets/create", "markets/update"):
         try:
-            sync_shop_profile(table, shop, token, api_version)
+            sync_shop_profile(table, shop, token, api_version, auth=auth)
         except Exception:
             logger.exception("shop_profile_webhook_failed", extra={"shop": shop, "topic": t})
         return
@@ -640,6 +664,7 @@ def _execute_webhook_envelope(
                 token,
                 api_version,
                 billing_country=str(meta.get("billing_country_code") or ""),
+                auth=auth,
             )
         except Exception:
             logger.exception("markets_delete_resync_failed", extra={"shop": shop})

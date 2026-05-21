@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 from .markets_sync import sync_market_rates_after_profile
 from .models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
 from .shop_enabled_currencies import sync_shop_enabled_currencies
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 
 SHOP_QUERY = """
 query ShopProfile {
@@ -42,10 +42,14 @@ def sync_shop_profile(
     shop: str,
     token: str,
     api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> dict[str, Any]:
     """Fetch shop from Admin GraphQL and merge into METADATA. Returns updated shop fields dict."""
     shop_norm = shop.strip().lower().rstrip("/")
-    data = graphql_request(shop_norm, token, SHOP_QUERY, {}, api_version=api_version)
+    data = shop_admin_graphql_call(
+        shop_norm, token, SHOP_QUERY, {}, api_version, auth=auth, operation="shopProfile"
+    )
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
     s = data.get("data", {}).get("shop") or {}
@@ -118,6 +122,7 @@ def sync_shop_profile(
             token,
             api_version,
             billing_country=str(billing.get("countryCodeV2") or ""),
+            auth=auth,
         )
     except Exception:
         logger.warning("market_rates_sync_skipped", exc_info=True)
@@ -129,6 +134,7 @@ def sync_shop_profile(
             token,
             api_version,
             fallback_primary=str(s.get("currencyCode") or ""),
+            auth=auth,
         )
     except Exception:
         logger.warning("shop_enabled_currencies_sync_skipped", exc_info=True)

@@ -21,7 +21,15 @@ from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
-from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.shop_offline_access import (
+    LOCK_AFTER_CONSECUTIVE_401,
+    ShopAdminAuth,
+    ShopifyAuth401Error,
+    get_fresh_shop_access_token,
+    offline_token_recovery_reason,
+    recover_offline_token_from_session,
+    shopify_auth_401_response_body,
+)
 from lib.shopify_api import DEFAULT_API_VERSION
 
 logger = setup_logging("merchant_api")
@@ -71,6 +79,12 @@ def handler(event, context):
         return _resp(400, {"error": "cannot_resolve_shop"})
     shop_host = shop_host.strip().lower().rstrip("/")
 
+    recovery_resp = _try_recover_offline_token_from_session(
+        table, shop_host, token, payload, headers, req_id
+    )
+    if recovery_resp is not None:
+        return recovery_resp
+
     if method == "GET" and path == "/api/me":
         return _api_me(table, shop_host, payload, headers, req_id)
     if method == "POST" and path == "/api/activate":
@@ -85,6 +99,95 @@ def handler(event, context):
         return _put_merchant_premium_rules(event, table, shop_host, payload, headers, req_id)
 
     return _resp(404, {"error": "not_found"})
+
+
+def _try_recover_offline_token_from_session(
+    table,
+    shop_host: str,
+    session_token: str,
+    payload: dict,
+    headers: dict,
+    req_id: str,
+):
+    """When offline auth is expired or refresh is missing/near expiry, exchange session JWT for new offline pair."""
+    item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    if not item:
+        return None
+    reason = offline_token_recovery_reason(item)
+    if not reason:
+        return None
+
+    actor_sub = str(payload.get("sub") or "")
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    client_id = os.environ["SHOPIFY_CLIENT_ID"]
+    client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
+    critical = reason in ("offline_auth_expired", "missing_refresh", "refresh_expired")
+
+    try:
+        recover_offline_token_from_session(
+            table,
+            shop_host,
+            session_token,
+            kms_key_id=kms_key_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            meta=item,
+        )
+        append_audit(
+            table,
+            shop_host,
+            actor_type="merchant",
+            actor_id=actor_sub,
+            action="OFFLINE_TOKEN_SESSION_RECOVERY",
+            outcome="ok",
+            detail={"reason": reason},
+            http_path="/api/session-recovery",
+            request_id=req_id,
+            source_ip=_xff(headers),
+        )
+        return None
+    except ShopifyAuth401Error as e:
+        append_audit(
+            table,
+            shop_host,
+            actor_type="merchant",
+            actor_id=actor_sub,
+            action="OFFLINE_TOKEN_SESSION_RECOVERY",
+            outcome="failed",
+            detail={"reason": reason, "api": e.api_name},
+            http_path="/api/session-recovery",
+            request_id=req_id,
+            source_ip=_xff(headers),
+        )
+        row = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item") or item
+        return _resp(401, shopify_auth_401_response_body(e, row))
+    except Exception as e:
+        logger.exception(
+            "offline_token_session_recovery_error",
+            extra={"shop": shop_host, "reason": reason},
+        )
+        append_audit(
+            table,
+            shop_host,
+            actor_type="merchant",
+            actor_id=actor_sub,
+            action="OFFLINE_TOKEN_SESSION_RECOVERY",
+            outcome="failed",
+            detail={"reason": reason, "detail": str(e)[:200]},
+            http_path="/api/session-recovery",
+            request_id=req_id,
+            source_ip=_xff(headers),
+        )
+        if critical:
+            return _resp(
+                502,
+                {
+                    "error": "offline_token_recovery_failed",
+                    "reason": reason,
+                    "detail": str(e)[:400],
+                },
+            )
+        return None
 
 
 def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
@@ -138,6 +241,10 @@ def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
         "last_fx_usd_to_shop": item.get("last_fx_usd_to_shop"),
         "last_fx_as_of": item.get("last_fx_as_of"),
         "last_activation_error": item.get("last_activation_error"),
+        "last_offline_auth_401_api": item.get("last_offline_auth_401_api"),
+        "last_offline_auth_401_at": item.get("last_offline_auth_401_at"),
+        "offline_auth_401_consecutive_count": item.get("offline_auth_401_consecutive_count"),
+        "offline_auth_401_lock_threshold": LOCK_AFTER_CONSECUTIVE_401,
         "shop_enabled_currencies": sorted(parse_shop_enabled_currencies_json(item)),
         "shop_enabled_currencies_synced_at": item.get("shop_enabled_currencies_synced_at"),
     }
@@ -151,16 +258,17 @@ def _embed_deep_link_for_shop(table, shop_host: str, item: dict | None) -> str:
     theme_gid = resolve_main_theme_gid(item, table, shop_host)
     if not theme_gid and item and item.get("access_token_enc"):
         try:
-            token = get_fresh_shop_access_token(
+            api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+            auth = ShopAdminAuth(
                 table,
                 shop_host,
-                kms_key_id_fallback=os.environ["KMS_KEY_ID"],
-                client_id=os.environ["SHOPIFY_CLIENT_ID"],
-                client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
-                meta=item,
+                os.environ["KMS_KEY_ID"],
+                os.environ["SHOPIFY_CLIENT_ID"],
+                os.environ["SHOPIFY_CLIENT_SECRET"],
+                api_version,
+                _meta=item,
             )
-            api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
-            theme_gid = fetch_main_theme_gid(shop_host, token, api_version)
+            theme_gid = fetch_main_theme_gid(shop_host, auth.access_token(), api_version, auth=auth)
             if theme_gid:
                 update_main_theme_gid_metadata(table, shop_host, theme_gid)
         except Exception as e:
@@ -257,20 +365,24 @@ def _activate(table, shop_host: str, payload: dict, headers: dict, req_id: str):
     if not enc:
         return _resp(400, {"error": "missing_access_token"})
     kms_key_id = os.environ["KMS_KEY_ID"]
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    auth = ShopAdminAuth(
+        table,
+        shop_host,
+        kms_key_id,
+        os.environ["SHOPIFY_CLIENT_ID"],
+        os.environ["SHOPIFY_CLIENT_SECRET"],
+        api_version,
+        _meta=item,
+    )
     try:
-        shop_token = get_fresh_shop_access_token(
-            table,
-            shop_host,
-            kms_key_id_fallback=kms_key_id,
-            client_id=os.environ["SHOPIFY_CLIENT_ID"],
-            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
-            meta=item,
-        )
+        shop_token = auth.access_token()
+    except ShopifyAuth401Error as e:
+        return _resp(401, shopify_auth_401_response_body(e, item))
     except Exception as e:
         logger.exception("activate_token_resolve_failed", extra={"shop": shop_host})
         return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
 
-    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     actor_sub = str(payload.get("sub") or "")
     try:
         run_activate_app_safe(
@@ -281,7 +393,10 @@ def _activate(table, shop_host: str, payload: dict, headers: dict, req_id: str):
             kms_key_id,
             api_version,
             actor_sub=actor_sub,
+            auth=auth,
         )
+    except ShopifyAuth401Error as e:
+        return _resp(401, shopify_auth_401_response_body(e, item))
     except ActivateAppError as e:
         body: dict = {"error": e.code, "message": e.message}
         if e.currency:
@@ -436,6 +551,9 @@ def _sync_shop_currencies(table, shop_host: str, payload: dict, headers: dict, r
             client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
             meta=item,
         )
+    except ShopifyAuth401Error as e:
+        row = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item") or item
+        return _resp(401, shopify_auth_401_response_body(e, row))
     except Exception as e:
         logger.exception("sync_currencies_token_resolve_failed", extra={"shop": shop_host})
         return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})

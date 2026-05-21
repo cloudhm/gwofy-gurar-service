@@ -38,8 +38,10 @@ def test_install_bootstrap_enqueues_catalog_by_default():
             "activation_status": "UNACTIVATED",
         }
     }
+    auth = MagicMock()
+    auth.access_token.return_value = "token"
     with (
-        patch("worker_handler._shop_admin_token", return_value="token"),
+        patch("worker_handler._shop_admin_auth", return_value=auth),
         patch("worker_handler._ensure_global_config_seeds"),
         patch("worker_handler.sync_shop_profile"),
         patch("worker_handler._maybe_auto_activate"),
@@ -59,8 +61,10 @@ def test_install_bootstrap_skips_enqueue_when_disabled():
             "access_token_enc": "enc",
         }
     }
+    auth = MagicMock()
+    auth.access_token.return_value = "token"
     with (
-        patch("worker_handler._shop_admin_token", return_value="token"),
+        patch("worker_handler._shop_admin_auth", return_value=auth),
         patch("worker_handler._ensure_global_config_seeds"),
         patch("worker_handler.sync_shop_profile"),
         patch("worker_handler._maybe_auto_activate"),

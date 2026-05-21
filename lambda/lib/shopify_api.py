@@ -9,7 +9,7 @@ import hmac
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 import requests
 
 _log = logging.getLogger(__name__)
@@ -51,6 +51,33 @@ def exchange_token(shop: str, client_id: str, client_secret: str, code: str) -> 
         "client_id": client_id,
         "client_secret": client_secret,
         "code": code,
+        "expiring": "1",
+    }
+    r = requests.post(
+        url,
+        data=data,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def exchange_session_token_for_offline_access(
+    shop: str,
+    client_id: str,
+    client_secret: str,
+    session_token: str,
+) -> dict[str, Any]:
+    """Token exchange: App Bridge session JWT → expiring offline access + refresh pair."""
+    url = f"https://{shop}/admin/oauth/access_token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": session_token,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "requested_token_type": "urn:shopify:params:oauth:token-type:offline-access-token",
         "expiring": "1",
     }
     r = requests.post(
@@ -108,22 +135,20 @@ def migrate_non_expiring_offline_token(
     return r.json()
 
 
-def graphql_request(
-    shop: str,
-    access_token: str,
-    query: str,
-    variables: dict[str, Any] | None = None,
-    api_version: str = DEFAULT_API_VERSION,
-    max_retries: int = 5,
-) -> dict[str, Any]:
-    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
-    payload = {"query": query}
-    if variables:
-        payload["variables"] = variables
-    headers = {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": access_token,
-    }
+def admin_graphql_api_label(api_version: str, operation: str | None = None) -> str:
+    label = f"POST /admin/api/{api_version}/graphql.json"
+    if operation:
+        label += f" ({operation})"
+    return label
+
+
+def _graphql_post(
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    *,
+    max_retries: int,
+) -> requests.Response:
     attempt = 0
     while True:
         attempt += 1
@@ -131,23 +156,54 @@ def graphql_request(
         if r.status_code == 429:
             retry_after = float(r.headers.get("Retry-After", "2"))
             if attempt >= max_retries:
-                r.raise_for_status()
+                return r
             time.sleep(min(retry_after, 30))
             continue
         if r.status_code >= 500 and attempt < max_retries:
             time.sleep(min(2**attempt, 30))
             continue
-        if r.status_code >= 400:
-            _log.warning(
-                "shopify_admin_http_error",
-                extra={
-                    "status": r.status_code,
-                    "url": url,
-                    "body_preview": (r.text or "")[:1200],
-                },
-            )
-        r.raise_for_status()
-        return r.json()
+        return r
+
+
+def graphql_request(
+    shop: str,
+    access_token: str,
+    query: str,
+    variables: dict[str, Any] | None = None,
+    api_version: str = DEFAULT_API_VERSION,
+    max_retries: int = 5,
+    *,
+    access_token_refresh: Callable[[], str] | None = None,
+    record_401: Callable[[str], None] | None = None,
+    api_operation: str | None = None,
+) -> dict[str, Any]:
+    url = f"https://{shop}/admin/api/{api_version}/graphql.json"
+    op_label = api_operation or admin_graphql_api_label(api_version)
+    payload: dict[str, Any] = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": access_token,
+    }
+    r = _graphql_post(url, headers, payload, max_retries=max_retries)
+    if r.status_code == 401 and access_token_refresh is not None:
+        headers["X-Shopify-Access-Token"] = access_token_refresh()
+        r = _graphql_post(url, headers, payload, max_retries=max_retries)
+    if r.status_code == 401 and record_401 is not None:
+        record_401(op_label)
+    if r.status_code >= 400:
+        _log.warning(
+            "shopify_admin_http_error",
+            extra={
+                "status": r.status_code,
+                "url": url,
+                "api_operation": op_label,
+                "body_preview": (r.text or "")[:1200],
+            },
+        )
+    r.raise_for_status()
+    return r.json()
 
 
 def register_webhook_rest(

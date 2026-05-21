@@ -14,7 +14,7 @@ from lib import protection_product as pp
 def test_create_product_input_has_no_variants_field():
     create_vars: dict = {}
 
-    def fake_gql(shop, token, query, variables, api_version=""):
+    def fake_gql(shop, token, query, variables, api_version="", **kwargs):
         if "productCreate" in query:
             create_vars.update(variables)
             return {
@@ -36,7 +36,7 @@ def test_create_product_input_has_no_variants_field():
 
     tiers = [("S0001", Decimal("0.89"), "S0001"), ("S0002", Decimal("1.99"), "S0002")]
 
-    with patch.object(pp, "graphql_request", side_effect=fake_gql):
+    with patch.object(pp, "_protection_gql", side_effect=fake_gql):
         with patch.object(pp, "_bulk_create_chunks") as bulk:
             gid = pp._create_new_protection_product(
                 "s.myshopify.com",

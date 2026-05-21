@@ -39,15 +39,10 @@ def test_auto_activate_calls_run_activate_when_unactivated():
             "2026-04",
             {"activation_status": "UNACTIVATED"},
         )
-    run.assert_called_once_with(
-        table,
-        "a.myshopify.com",
-        "1001",
-        "token",
-        "kms-key",
-        "2026-04",
-        actor_sub="initial_sync",
-    )
+    run.assert_called_once()
+    kw = run.call_args.kwargs
+    assert kw["actor_sub"] == "initial_sync"
+    assert run.call_args[0][:5] == (table, "a.myshopify.com", "1001", "token", "kms-key")
 
 
 def test_auto_activate_swallows_business_error():

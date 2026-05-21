@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .models import pk_tenant
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 from .sync_denorm import denorm_product_top_fields
 
 PRODUCTS_LIST_QUERY = """
@@ -137,17 +137,19 @@ def _raise_if_errors(data: dict[str, Any], ctx: str) -> None:
 
 
 def _paginate_product_metafield_edges(
-    shop: str, token: str, product_gid: str, api_version: str
+    shop: str, token: str, product_gid: str, api_version: str, *, auth: ShopAdminAuth | None = None
 ) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop,
             token,
             PRODUCT_METAFIELDS_PAGE_Q,
             {"id": product_gid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="productGraphql",
         )
         _raise_if_errors(data, "product_metafields")
         conn = ((data.get("data") or {}).get("product") or {}).get("metafields") or {}
@@ -160,17 +162,19 @@ def _paginate_product_metafield_edges(
 
 
 def _paginate_product_media_edges(
-    shop: str, token: str, product_gid: str, api_version: str
+    shop: str, token: str, product_gid: str, api_version: str, *, auth: ShopAdminAuth | None = None
 ) -> list[dict[str, Any]]:
     edges: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop,
             token,
             PRODUCT_MEDIA_PAGE_Q,
             {"id": product_gid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="productGraphql",
         )
         _raise_if_errors(data, "product_media")
         conn = ((data.get("data") or {}).get("product") or {}).get("media") or {}
@@ -183,19 +187,27 @@ def _paginate_product_media_edges(
 
 
 def _merge_variant_metafield_pages(
-    shop: str, token: str, variant_gid: str, mf_conn: dict[str, Any], api_version: str
+    shop: str,
+    token: str,
+    variant_gid: str,
+    mf_conn: dict[str, Any],
+    api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> dict[str, Any]:
     """Return metafields dict with full edges list (no pageInfo required downstream)."""
     edges: list[dict[str, Any]] = list((mf_conn or {}).get("edges") or [])
     pi = (mf_conn or {}).get("pageInfo") or {}
     cursor = pi.get("endCursor")
     while pi.get("hasNextPage"):
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop,
             token,
             VARIANT_METAFIELDS_PAGE_Q,
             {"id": variant_gid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="productGraphql",
         )
         _raise_if_errors(data, "variant_metafields")
         node = (data.get("data") or {}).get("node") or {}
@@ -207,17 +219,19 @@ def _merge_variant_metafield_pages(
 
 
 def _paginate_product_variant_edges(
-    shop: str, token: str, product_gid: str, api_version: str
+    shop: str, token: str, product_gid: str, api_version: str, *, auth: ShopAdminAuth | None = None
 ) -> list[dict[str, Any]]:
     out_edges: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop,
             token,
             PRODUCT_VARIANTS_PAGE_Q,
             {"id": product_gid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="productGraphql",
         )
         _raise_if_errors(data, "product_variants")
         conn = ((data.get("data") or {}).get("product") or {}).get("variants") or {}
@@ -227,7 +241,7 @@ def _paginate_product_variant_edges(
                 continue
             mf_root = vn.get("metafields") or {}
             vn["metafields"] = _merge_variant_metafield_pages(
-                shop, token, vn["id"], mf_root, api_version
+                shop, token, vn["id"], mf_root, api_version, auth=auth
             )
             out_edges.append({"node": vn})
         pi = conn.get("pageInfo") or {}
@@ -238,20 +252,26 @@ def _paginate_product_variant_edges(
 
 
 def fetch_merged_product_node(
-    shop: str, token: str, product_gid: str, api_version: str
+    shop: str, token: str, product_gid: str, api_version: str, *, auth: ShopAdminAuth | None = None
 ) -> dict[str, Any] | None:
     """Load one product with all metafields, media, and variants (fully paginated)."""
     shop_norm = shop.strip().lower().rstrip("/")
-    data = graphql_request(
-        shop_norm, token, PRODUCT_BASE_Q, {"id": product_gid}, api_version=api_version
+    data = shop_admin_graphql_call(
+        shop_norm,
+        token,
+        PRODUCT_BASE_Q,
+        {"id": product_gid},
+        api_version,
+        auth=auth,
+        operation="productBase",
     )
     _raise_if_errors(data, "product_base")
     base = (data.get("data") or {}).get("product")
     if not base:
         return None
-    mf_edges = _paginate_product_metafield_edges(shop_norm, token, product_gid, api_version)
-    media_edges = _paginate_product_media_edges(shop_norm, token, product_gid, api_version)
-    variant_edges = _paginate_product_variant_edges(shop_norm, token, product_gid, api_version)
+    mf_edges = _paginate_product_metafield_edges(shop_norm, token, product_gid, api_version, auth=auth)
+    media_edges = _paginate_product_media_edges(shop_norm, token, product_gid, api_version, auth=auth)
+    variant_edges = _paginate_product_variant_edges(shop_norm, token, product_gid, api_version, auth=auth)
     merged: dict[str, Any] = {
         **base,
         "metafields": {"edges": mf_edges},
@@ -357,6 +377,8 @@ def sync_products_initial(
     store_number: str,
     token: str,
     api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     """Full product pagination with checkpoint on SYNC#shop PRODUCTS#CHECKPOINT."""
     cursor = None
@@ -368,12 +390,14 @@ def sync_products_initial(
         cursor = cp.get("graphql_page_cursor")
 
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop_norm,
             token,
             PRODUCTS_LIST_QUERY,
             {"cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="productGraphql",
         )
         errors = data.get("errors")
         if errors:

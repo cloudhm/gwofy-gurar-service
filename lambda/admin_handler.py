@@ -50,7 +50,13 @@ from lib.merchant_premium_rules import parse_rules_from_meta
 from lib.kms_tokens import decrypt_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.shipping_country_defaults import get_shipping_country_defaults, put_shipping_country_defaults
-from lib.shop_offline_access import get_fresh_shop_access_token
+from lib.shop_offline_access import (
+    ShopAdminAuth,
+    ShopifyAuth401Error,
+    get_fresh_shop_access_token,
+    retry_shop_offline_token_refresh,
+    shopify_auth_401_response_body,
+)
 from lib.admin_shop_sync import normalize_resources, run_admin_shop_sync
 from lib.shopify_api import DEFAULT_API_VERSION
 
@@ -184,6 +190,9 @@ def handler(event, context):
 
     if method == "POST" and len(parts) == 4 and parts[3] == "sync-enabled-currencies":
         return _post_admin_sync_shop_currencies(event, table, shop, actor_sub, actor_email, req_id)
+
+    if method == "POST" and len(parts) == 4 and parts[3] == "retry-offline-token":
+        return _post_admin_retry_offline_token(table, shop, actor_sub, actor_email, req_id)
 
     if method == "POST" and len(parts) == 4 and parts[3] == "sync":
         return _post_admin_shop_sync(event, table, shop, actor_sub, actor_email, req_id)
@@ -570,6 +579,43 @@ def _put_max_coverage_by_currency(event, table, actor_sub: str, actor_email: str
     return _resp(200, {"ok": True})
 
 
+def _post_admin_retry_offline_token(
+    table, shop: str, actor_sub: str, actor_email: str, req_id: str
+):
+    """POST /admin/shops/{shop}/retry-offline-token — force OAuth refresh, restore ACTIVE when valid."""
+    meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    if not meta.get("access_token_enc"):
+        return _resp(400, {"error": "missing_access_token"})
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    try:
+        result = retry_shop_offline_token_refresh(
+            table,
+            shop,
+            kms_key_id_fallback=kms_key_id,
+            client_id=os.environ["SHOPIFY_CLIENT_ID"],
+            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+        )
+    except ShopifyAuth401Error as e:
+        return _resp(401, shopify_auth_401_response_body(e, meta))
+    except Exception as e:
+        return _resp(500, {"error": "retry_offline_token_failed", "detail": str(e)[:400]})
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_RETRY_OFFLINE_TOKEN",
+        outcome="ok",
+        actor_email=actor_email or None,
+        detail=result,
+        http_path=f"/admin/shops/{shop}/retry-offline-token",
+        request_id=req_id,
+    )
+    return _resp(200, result)
+
+
 def _post_admin_sync_shop_currencies(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
@@ -578,22 +624,26 @@ def _post_admin_sync_shop_currencies(event, table, shop: str, actor_sub: str, ac
     if not enc:
         return _resp(400, {"error": "missing_access_token"})
     kms_key_id = os.environ["KMS_KEY_ID"]
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    auth = ShopAdminAuth(
+        table,
+        shop,
+        kms_key_id,
+        os.environ["SHOPIFY_CLIENT_ID"],
+        os.environ["SHOPIFY_CLIENT_SECRET"],
+        api_version,
+        _meta=meta,
+    )
     try:
-        token = get_fresh_shop_access_token(
-            table,
-            shop,
-            kms_key_id_fallback=kms_key_id,
-            client_id=os.environ["SHOPIFY_CLIENT_ID"],
-            client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
-            meta=meta,
-        )
+        token = auth.access_token()
+    except ShopifyAuth401Error as e:
+        return _resp(401, shopify_auth_401_response_body(e, meta))
     except Exception as e:
         return _resp(500, {"error": "token_resolve_failed", "detail": str(e)[:400]})
-    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
     fb = str(meta.get("shop_currency_code") or "").strip().upper()
     try:
         codes = sync_shop_enabled_currencies(
-            table, shop, token, api_version, fallback_primary=fb or None
+            table, shop, token, api_version, fallback_primary=fb or None, auth=auth
         )
     except Exception as e:
         return _resp(502, {"error": "sync_shop_currencies_failed", "detail": str(e)[:500]})

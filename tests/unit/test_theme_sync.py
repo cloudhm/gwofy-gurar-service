@@ -69,7 +69,7 @@ def test_sync_themes_pagination_and_metadata():
         "updatedAt": "2024-01-01T00:00:00Z",
     }
 
-    def fake_gql(shop, token, query, variables=None, api_version=None):
+    def fake_gql(shop, token, query, variables=None, api_version=None, **kwargs):
         if "ThemesPage" in query:
             if variables.get("cursor"):
                 return _themes_page([theme_main])
@@ -85,7 +85,7 @@ def test_sync_themes_pagination_and_metadata():
             )
         raise AssertionError(f"unexpected query: {query[:80]}")
 
-    with patch("lib.theme_sync.graphql_request", side_effect=fake_gql):
+    with patch("lib.theme_sync.shop_admin_graphql_call", side_effect=fake_gql):
         stats = sync_themes_full(table, "a.myshopify.com", "tok", "2026-04")
 
     assert stats["themes_count"] == 2
@@ -122,14 +122,14 @@ def test_oversized_file_not_stored():
         "updatedAt": "2024-01-01T00:00:00Z",
     }
 
-    def fake_gql(shop, token, query, variables=None, api_version=None):
+    def fake_gql(shop, token, query, variables=None, api_version=None, **kwargs):
         if "ThemesPage" in query:
             return _themes_page([theme_node])
         if "ThemeFilesPage" in query:
             return _files_page([{"filename": "assets/huge.js", "body": {"content": huge}}])
         raise AssertionError("unexpected")
 
-    with patch("lib.theme_sync.graphql_request", side_effect=fake_gql):
+    with patch("lib.theme_sync.shop_admin_graphql_call", side_effect=fake_gql):
         sync_themes_full(table, "a.myshopify.com", "tok", "2026-04")
 
     file_puts = [
@@ -145,10 +145,10 @@ def test_oversized_file_not_stored():
 def test_access_denied_skips_without_raise():
     table = MagicMock()
 
-    def fake_gql(shop, token, query, variables=None, api_version=None):
+    def fake_gql(shop, token, query, variables=None, api_version=None, **kwargs):
         return {"errors": [{"message": "Access denied", "extensions": {"code": "ACCESS_DENIED"}}]}
 
-    with patch("lib.theme_sync.graphql_request", side_effect=fake_gql):
+    with patch("lib.theme_sync.shop_admin_graphql_call", side_effect=fake_gql):
         stats = sync_themes_full(table, "a.myshopify.com", "tok", "2026-04")
 
     assert stats["skipped"] is True

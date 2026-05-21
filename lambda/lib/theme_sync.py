@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .models import SK_METADATA, pk_shop
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 
 logger = logging.getLogger(__name__)
 
@@ -123,17 +123,21 @@ def _sync_theme_files(
     token: str,
     api_version: str,
     now: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> int:
     """Paginate theme files; return count of file rows written."""
     cursor: str | None = None
     written = 0
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop_norm,
             token,
             THEME_FILES_PAGE_QUERY,
             {"id": theme_gid, "cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="themeFiles",
         )
         errors = data.get("errors")
         if errors:
@@ -178,16 +182,20 @@ def _sync_theme_files(
     return written
 
 
-def _fetch_all_themes(shop_norm: str, token: str, api_version: str) -> list[dict[str, Any]]:
+def _fetch_all_themes(
+    shop_norm: str, token: str, api_version: str, *, auth: ShopAdminAuth | None = None
+) -> list[dict[str, Any]]:
     cursor: str | None = None
     themes: list[dict[str, Any]] = []
     while True:
-        data = graphql_request(
+        data = shop_admin_graphql_call(
             shop_norm,
             token,
             THEMES_PAGE_QUERY,
             {"cursor": cursor},
-            api_version=api_version,
+            api_version,
+            auth=auth,
+            operation="themes",
         )
         errors = data.get("errors")
         if errors:
@@ -206,9 +214,13 @@ def _fetch_all_themes(shop_norm: str, token: str, api_version: str) -> list[dict
     return themes
 
 
-def fetch_main_theme_gid(shop_norm: str, token: str, api_version: str) -> str:
+def fetch_main_theme_gid(
+    shop_norm: str, token: str, api_version: str, *, auth: ShopAdminAuth | None = None
+) -> str:
     """Return MAIN role theme GID from Shopify (no Dynamo writes)."""
-    for node in _fetch_all_themes(shop_norm.strip().lower().rstrip("/"), token, api_version):
+    for node in _fetch_all_themes(
+        shop_norm.strip().lower().rstrip("/"), token, api_version, auth=auth
+    ):
         if str(node.get("role") or "") == "MAIN":
             return str(node.get("id") or "")
     return ""
@@ -243,11 +255,13 @@ def sync_themes_full(
     shop: str,
     token: str,
     api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
 ) -> dict[str, Any]:
     """Fetch all themes + files; update SHOP METADATA summary. Returns sync stats."""
     shop_norm = shop.strip().lower().rstrip("/")
     now = datetime.now(timezone.utc).isoformat()
-    themes = _fetch_all_themes(shop_norm, token, api_version)
+    themes = _fetch_all_themes(shop_norm, token, api_version, auth=auth)
     if not themes:
         return {"themes_count": 0, "files_count": 0, "skipped": True}
 
@@ -267,7 +281,9 @@ def sync_themes_full(
             main_name = str(node.get("name") or "")
             main_role = role
         try:
-            files_count += _sync_theme_files(table, shop_norm, gid, token, api_version, now)
+            files_count += _sync_theme_files(
+                table, shop_norm, gid, token, api_version, now, auth=auth
+            )
         except Exception:
             logger.warning(
                 "theme_files_sync_failed",

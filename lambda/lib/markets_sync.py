@@ -10,7 +10,7 @@ from typing import Any
 
 from .models import SK_METADATA, pk_shop
 from .shipping_country_defaults import get_shipping_country_defaults, supported_country_codes
-from .shopify_api import graphql_request
+from .shop_offline_access import ShopAdminAuth, shop_admin_graphql_call
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +50,13 @@ def _country_codes_from_markets_payload(data: dict[str, Any]) -> list[str]:
     return out
 
 
-def fetch_market_country_codes(shop: str, token: str, api_version: str) -> list[str]:
+def fetch_market_country_codes(
+    shop: str, token: str, api_version: str, *, auth: ShopAdminAuth | None = None
+) -> list[str]:
     shop = shop.strip().lower().rstrip("/")
-    data = graphql_request(shop, token, MARKETS_Q, {}, api_version=api_version)
+    data = shop_admin_graphql_call(
+        shop, token, MARKETS_Q, {}, api_version, auth=auth, operation="markets"
+    )
     if data.get("errors"):
         logger.warning("markets_query_errors", extra={"errors": str(data["errors"])[:500]})
         return []
@@ -114,12 +118,13 @@ def sync_market_rates_after_profile(
     api_version: str,
     *,
     billing_country: str | None = None,
+    auth: ShopAdminAuth | None = None,
 ) -> None:
     """After shop profile row exists: merge 4% defaults for Markets countries + billing country."""
     shop_norm = shop.strip().lower().rstrip("/")
     meta = table.get_item(Key={"pk": pk_shop(shop_norm), "sk": SK_METADATA}).get("Item") or {}
     existing = meta.get("sp_market_rates_json")
-    countries = fetch_market_country_codes(shop_norm, token, api_version)
+    countries = fetch_market_country_codes(shop_norm, token, api_version, auth=auth)
     bc = (billing_country or meta.get("billing_country_code") or "").strip().upper()
     if bc and bc not in countries:
         countries = [bc, *countries]

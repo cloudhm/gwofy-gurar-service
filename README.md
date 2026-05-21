@@ -199,7 +199,6 @@ jobs:
    **`read_themes` scope**：`shopify.app.toml` 已包含该 scope；Partner Dashboard 须一致。**已安装店铺** 若未重新授权，主题同步会跳过（ACCESS_DENIED），不影响安装与其它同步。管理端可 **`POST /admin/shops/{shop}/sync`**，`resources` 含 **`themes`** 手动补拉。
 
    **可过期离线 token（Shopify 2025-12+）**：向 `https://{shop}/admin/oauth/authorize` 发起 **offline** 授权时，查询串须包含 **`expiring=1`**（与 [Shopify 文档](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens) 一致）。本仓库 `/oauth/callback` 换票已固定带 **`expiring=1`**，并在 Dynamo **METADATA** 写入 `refresh_token_enc`、`shopify_offline_access_token_expires_at`、`shopify_offline_refresh_token_expires_at`。Worker / 商户 / 管理接口在调用 Admin API 前会 **自动 refresh**；若仍为历史 **非过期** token，会在首次请求时 **一次性迁移** 为可过期对（旧 token 随即作废）。仅用 `POST /admin/tools/decrypt-shopify-token` 取出的明文若未经过上述逻辑，在 Postman 里可能仍被 Shopify 拒绝，请触发任意已接线路径或重装授权。
-
 ### 自定义域名（gwofy.com）
 
 约定：**子域名为 `sp-{stage}` + 根域名 `gwofy.com`**，与 CDK `stage` 一致。例如：
@@ -247,6 +246,8 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 ### 商户端（Shopify Session Token JWT）
 
 路径均位于 `{HttpApiUrl}` 根下，请求头 `Authorization: Bearer <session_token>`（与 [Session token](https://shopify.dev/docs/apps/auth/session-tokens) 一致）。
+
+**离线 token 自动补救**（所有上表 Session 路由，不含 `/api/cart-config`）：若 `installation_status=OFFLINE_AUTH_EXPIRED`、缺少 `refresh_token_enc`、或 refresh 将在 **7** 天内过期（`OFFLINE_REFRESH_RECOVERY_WINDOW_DAYS`），后端用当前 Session Token 做 [token exchange](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange) 换新 offline 对并恢复 **ACTIVE**（审计 `OFFLINE_TOKEN_SESSION_RECOVERY`）；关键失败 **401** `shopify_offline_auth_failed` / **502** `offline_token_recovery_failed`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
