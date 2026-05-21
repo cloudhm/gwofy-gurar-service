@@ -14,7 +14,12 @@ def test_normalize_all_expands():
         "orders",
         "currencies",
         "markets",
+        "themes",
     ]
+
+
+def test_normalize_themes():
+    assert normalize_resources(["theme"]) == ["themes"]
 
 
 def test_normalize_catalog():

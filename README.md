@@ -194,7 +194,9 @@ jobs:
 
    **Shopify 侧**：同一应用可在 Partner Dashboard 配置 **多个 redirect URL**（dev/staging/prod 各一条）；Webhook 地址亦可按环境各配一条。也可为 dev/prod 分别创建 Custom app，隔离 `client_id`。
 
-5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。Worker 的 **`INITIAL_SYNC`** 仅做 **店铺资料**（币种、市场等）与 **自动激活**（创建 Shipping Protection 商品）；完成后 **异步入队 `CATALOG_SYNC`**，在后台慢慢全量拉取商品与订单。激活失败不阻塞入队；错误写入 `last_activation_error`，可稍后 **`POST /api/activate`** 重试。
+5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。Worker 的 **`INITIAL_SYNC`** 仅做 **店铺资料**（币种、市场等）与 **自动激活**（创建 Shipping Protection 商品）；完成后 **异步入队 `CATALOG_SYNC`**（商品/订单）与 **`THEME_SYNC`**（Online Store 主题及文件）。激活失败不阻塞入队；错误写入 `last_activation_error`，可稍后 **`POST /api/activate`** 重试。
+
+   **`read_themes` scope**：`shopify.app.toml` 已包含该 scope；Partner Dashboard 须一致。**已安装店铺** 若未重新授权，主题同步会跳过（ACCESS_DENIED），不影响安装与其它同步。管理端可 **`POST /admin/shops/{shop}/sync`**，`resources` 含 **`themes`** 手动补拉。
 
    **可过期离线 token（Shopify 2025-12+）**：向 `https://{shop}/admin/oauth/authorize` 发起 **offline** 授权时，查询串须包含 **`expiring=1`**（与 [Shopify 文档](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/offline-access-tokens) 一致）。本仓库 `/oauth/callback` 换票已固定带 **`expiring=1`**，并在 Dynamo **METADATA** 写入 `refresh_token_enc`、`shopify_offline_access_token_expires_at`、`shopify_offline_refresh_token_expires_at`。Worker / 商户 / 管理接口在调用 Admin API 前会 **自动 refresh**；若仍为历史 **非过期** token，会在首次请求时 **一次性迁移** 为可过期对（旧 token 随即作废）。仅用 `POST /admin/tools/decrypt-shopify-token` 取出的明文若未经过上述逻辑，在 Postman 里可能仍被 Shopify 拒绝，请触发任意已接线路径或重装授权。
 
@@ -248,7 +250,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link`、`last_activation_error`（激活失败时的 JSON 字符串，成功激活后清除）等 |
+| GET | `/api/me` | 返回 `auth_id`（即 `store_number`）、`activation_status`、险种状态、`shop_currency_code`、`embed_deep_link`、`last_activation_error`（激活失败时的 JSON 字符串，成功激活后清除）等。`embed_deep_link` 为 `https://admin.shopify.com/store/{shop_handle}/themes/{theme_id}/editor?context=apps&appEmbed=...&previewPath=...`（`theme_id` 取自 **MAIN** 主题；无缓存时 `/api/me` 会 live 拉取并写入 `main_theme_gid`，仍未知则为空字符串） |
 | POST | `/api/activate` | **同步**激活或再次激活（安装后 Worker 也会自动尝试一次）：商户 Lambda 内用店铺离线 token 创建/更新 Shipping Protection 商品并写回 `protection_product_gid`。成功 **200** `{"ok":true,"activation_status":"ACTIVATED"}`；业务错误 **400**（如 `shop_profile_not_ready`、`currency_not_supported`、`pricing_not_configured`）；解密/Shopify 异常 **500/502**。激活**不会**调用 `sync_shop_profile`；`shop_currency_code` 须已由安装全量同步 / webhook / 定时对账写入 METADATA。HTTP API 与 Lambda 超时请见栈配置（商户 Lambda 已放宽以便多变体 upsert）。 |
 | PATCH | `/api/me/embed` | JSON body：`{"embed_enabled_ack": true}` |
 | POST | `/api/cart-config` | **无 Session JWT**（同上 HMAC）。**必填** `country`（ISO2）、`shopDomain`。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。国家不在全局支持列表 → **400** `country_not_supported`（`country` 仅用于 **费率** 等，**不参与保额**）。`X-Gwofy-Shop` 须与 `shopDomain` 主机名一致。**响应** `calcInfo` 含 **`maxAmount`**、**`maxAmountCurrency`**、`spRate` 等；并含 **`merchantPremiumRules`**（从店铺 `METADATA.merchant_premium_rules_json` 解析，与 **`GET /api/me/merchant-premium-rules`** 同源；无效或缺失时为默认空规则）。**服务端不下发最终加价后金额**， storefront / App 按规则自行计算。 |
@@ -276,7 +278,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 - 可通过环境变量或 CDK context **`admin_cognito_group`** / `ADMIN_COGNITO_GROUP` 覆盖默认组名（一般保持 `GWOFY-SHIPPING-PROTECTION` 即可）。
 - **Cognito Hosted UI 回调**：`GET /auth/callback`（**无需** JWT）。浏览器从 Cognito **`/oauth2/authorize`** 授权后带 `?code=` 重定向至此；Lambda 向 Cognito **`/oauth2/token`** 换 token，默认返回 **HTML**（可复制 **Id token** 用于 `Authorization: Bearer`）；请求头 **`Accept: application/json`** 时返回 JSON。**回调 URL** 由 **`WEBHOOK_BASE_URL` + `/auth/callback`** 组成（须与 Cognito App Client 里配置的 Allowed callback URLs **完全一致**）。部署前还需设置 **`COGNITO_HOSTED_UI_DOMAIN`**（或 `-c cognito_hosted_ui_domain=`），值为 Cognito **域名前缀主机名**，例如 **`ap-east-1xxxx.auth.ap-east-1.amazoncognito.com`**（不要带 `https://`）。
 - 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience = `AdminCognitoUserPoolClientId`）：
-  - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）
+  - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）；列表项含 **`main_theme_gid`**（MAIN 主题 GID，主题同步或 `/api/me` live 拉取后写入）
   - `GET /admin/shops/{shop}`（`shop` 需 URL 编码；`shop` 对象内含 **`shop_enabled_currencies`** 解析数组，便于配置保额 UI）
   - `GET /admin/shops/{shop}/detail` — 与上一行相同返回完整 **`shop`** METADATA（**不脱敏**，含 `access_token_enc` 等，仅限可信管理环境）；并返回 **`merchantPremiumRules`**（解析自 `merchant_premium_rules_json`）。若存储 JSON 无效则 **`merchantPremiumRules`** 为默认空规则且可能带 **`merchant_premium_rules_parse_warning`**。
   - `POST /admin/tools/decrypt-shopify-token`，body：`{"access_token_enc":"<KMS Base64 密文>","kms_key_id":"<可选，缺省用 Lambda KMS_KEY_ID>","shop":"<可选，审计归属店铺 host；缺省为内部占位>"}` → **200** `{"ok":true,"access_token":"<明文 Shopify token>"}`（**极高敏感**，仅管理组；失败 **502** `decrypt_failed`；写审计 **`ADMIN_DECRYPT_SHOPIFY_TOKEN`**，**detail 不含明文**）

@@ -899,6 +899,7 @@ def _list_shops(event, table, actor_sub: str, req_id: str):
                 "shipping_protection_status": it.get("shipping_protection_status"),
                 "plugin_suspended": it.get("plugin_suspended"),
                 "shop_currency_code": it.get("shop_currency_code"),
+                "main_theme_gid": it.get("main_theme_gid"),
             }
         )
     next_cursor = None

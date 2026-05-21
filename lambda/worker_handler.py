@@ -30,6 +30,7 @@ from lib.product_sync import fetch_merged_product_node
 from lib.product_sync import product_snapshot_from_graphql
 from lib.product_sync import sync_products_initial
 from lib.shop_profile_sync import sync_shop_profile
+from lib.theme_sync import sync_themes_full
 from lib.shopify_api import DEFAULT_API_VERSION, graphql_request
 from lib.sync_denorm import denorm_order_top_fields, denorm_product_top_fields
 from lib.order_protection import order_has_protection_product
@@ -93,7 +94,7 @@ def _oauth_install_job_sort_key(body: dict[str, Any]) -> int:
         return 0
     if ev == "INITIAL_SYNC":
         return 1
-    if ev == "CATALOG_SYNC":
+    if ev in ("CATALOG_SYNC", "THEME_SYNC"):
         return 2
     return 50
 
@@ -172,6 +173,8 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
             run_install_bootstrap(table, shop, store_number, kms_key_id, api_version)
         elif ev == "CATALOG_SYNC":
             run_catalog_sync(table, shop, store_number, kms_key_id, api_version)
+        elif ev == "THEME_SYNC":
+            run_theme_sync(table, shop, store_number, kms_key_id, api_version)
         elif ev == "APP_INSTALLED":
             send_text(
                 feishu_url,
@@ -415,6 +418,25 @@ def _enqueue_catalog_sync(shop: str, store_number: str, api_version: str) -> Non
     )
 
 
+def _enqueue_theme_sync(shop: str, store_number: str, api_version: str) -> None:
+    q = os.environ.get("WORK_QUEUE_URL")
+    if not q:
+        logger.warning("theme_sync_enqueue_skipped_no_queue", extra={"shop": shop})
+        return
+    body = {
+        "source": "oauth",
+        "event": "THEME_SYNC",
+        "shop": shop,
+        "store_number": store_number,
+        "api_version": api_version,
+    }
+    r = sqs.send_message(QueueUrl=q, MessageBody=json.dumps(body))
+    logger.info(
+        "theme_sync_enqueued",
+        extra={"shop": shop, "store_number": store_number, "sqs_message_id": r.get("MessageId")},
+    )
+
+
 def _ensure_global_config_seeds(table_name: str) -> None:
     ensure_default_pricing_seed(table_name)
     ensure_shipping_country_defaults_seed(table_name)
@@ -432,8 +454,9 @@ def run_install_bootstrap(
     api_version: str,
     *,
     enqueue_catalog: bool = True,
+    enqueue_themes: bool = True,
 ) -> None:
-    """Shop profile + markets/currency, then activate; optionally enqueue async catalog sync."""
+    """Shop profile + markets/currency, then activate; optionally enqueue async catalog/theme sync."""
     logger.info(
         "install_bootstrap_start",
         extra={"shop": shop, "store_number": store_number, "api_version": api_version},
@@ -455,6 +478,8 @@ def run_install_bootstrap(
     _maybe_auto_activate(table, shop, store_number, token, kms_key_id, api_version, meta)
     if enqueue_catalog:
         _enqueue_catalog_sync(shop, store_number, api_version)
+    if enqueue_themes:
+        _enqueue_theme_sync(shop, store_number, api_version)
     logger.info("install_bootstrap_complete", extra={"shop": shop, "store_number": store_number})
 
 
@@ -483,6 +508,29 @@ def run_catalog_sync(table, shop: str, store_number: str, kms_key_id: str, api_v
         table, shop, store_number, token, api_version, protection_product_gid=protection_gid
     )
     logger.info("catalog_sync_complete", extra={"shop": shop, "store_number": store_number})
+
+
+def run_theme_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:
+    """Async pull: online store themes and theme files."""
+    logger.info(
+        "theme_sync_start",
+        extra={"shop": shop, "store_number": store_number, "api_version": api_version},
+    )
+    meta = _shop_row(table, shop)
+    if not meta or meta.get("installation_status") != "ACTIVE":
+        logger.info("skip_theme_sync_not_active", extra={"shop": shop})
+        return
+    enc = meta.get("access_token_enc")
+    if not enc:
+        logger.warning("skip_theme_sync_no_token", extra={"shop": shop})
+        return
+    token = _shop_admin_token(table, shop, kms_key_id)
+    try:
+        sync_themes_full(table, shop, token, api_version)
+    except Exception:
+        logger.warning("theme_sync_failed", extra={"shop": shop}, exc_info=True)
+        return
+    logger.info("theme_sync_complete", extra={"shop": shop, "store_number": store_number})
 
 
 def run_initial_sync(table, shop: str, store_number: str, kms_key_id: str, api_version: str) -> None:

@@ -15,6 +15,8 @@ from lib.cart_config_response import build_cart_plugin_response
 from lib.shipping_country_defaults import is_country_supported
 from lib.logging_json import setup_logging
 from lib.merchant_premium_rules import normalize_for_storage, parse_rules_from_meta, validate_rules
+from lib.embed_deep_link import build_embed_deep_link, resolve_main_theme_gid
+from lib.theme_sync import fetch_main_theme_gid, update_main_theme_gid_metadata
 from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
@@ -87,8 +89,7 @@ def handler(event, context):
 
 def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
     item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
-    cid = os.environ["SHOPIFY_CLIENT_ID"]
-    embed_url = f"https://{shop_host}/admin/themes/current/editor?context=apps&activateAppId={cid}"
+    embed_url = _embed_deep_link_for_shop(table, shop_host, item)
     if not item:
         safe = {
             "shop": shop_host,
@@ -146,6 +147,40 @@ def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):
     return _resp(200, {"session": payload.get("sub"), "shop_metadata": safe})
 
 
+def _embed_deep_link_for_shop(table, shop_host: str, item: dict | None) -> str:
+    theme_gid = resolve_main_theme_gid(item, table, shop_host)
+    if not theme_gid and item and item.get("access_token_enc"):
+        try:
+            token = get_fresh_shop_access_token(
+                table,
+                shop_host,
+                kms_key_id_fallback=os.environ["KMS_KEY_ID"],
+                client_id=os.environ["SHOPIFY_CLIENT_ID"],
+                client_secret=os.environ["SHOPIFY_CLIENT_SECRET"],
+                meta=item,
+            )
+            api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+            theme_gid = fetch_main_theme_gid(shop_host, token, api_version)
+            if theme_gid:
+                update_main_theme_gid_metadata(table, shop_host, theme_gid)
+        except Exception as e:
+            logger.warning(
+                "embed_theme_gid_fetch_failed",
+                extra={"shop": shop_host, "detail": str(e)[:200]},
+            )
+    if (
+        not theme_gid
+        and item
+        and item.get("installation_status") == "ACTIVE"
+        and not item.get("themes_synced_at")
+    ):
+        _send_sqs_theme_sync(shop_host, str(item.get("store_number", "")))
+    meta_for_embed = dict(item) if item else {}
+    if theme_gid:
+        meta_for_embed["main_theme_gid"] = theme_gid
+    return build_embed_deep_link(shop_host, meta_for_embed, table)
+
+
 def _maybe_enqueue_profile_refresh(table, shop_host: str, item: dict) -> None:
     synced = item.get("shop_profile_synced_at")
     if not synced:
@@ -170,6 +205,25 @@ def _send_sqs_profile(shop: str, store_number: str) -> None:
             {
                 "source": "merchant_api",
                 "event": "SHOP_PROFILE_SYNC",
+                "shop": shop,
+                "store_number": store_number,
+                "api_version": api_version,
+            }
+        ),
+    )
+
+
+def _send_sqs_theme_sync(shop: str, store_number: str) -> None:
+    q = os.environ.get("WORK_QUEUE_URL")
+    if not q:
+        return
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    sqs.send_message(
+        QueueUrl=q,
+        MessageBody=json.dumps(
+            {
+                "source": "merchant_api",
+                "event": "THEME_SYNC",
                 "shop": shop,
                 "store_number": store_number,
                 "api_version": api_version,

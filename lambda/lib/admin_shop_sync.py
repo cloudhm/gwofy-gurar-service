@@ -11,6 +11,7 @@ from .models import SK_METADATA, pk_shop
 from .product_sync import sync_products_initial
 from .shop_enabled_currencies import sync_shop_enabled_currencies
 from .shop_profile_sync import sync_shop_profile
+from .theme_sync import sync_themes_full
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +27,13 @@ RESOURCE_ALIASES: dict[str, str] = {
     "currency": "currencies",
     "markets": "markets",
     "market": "markets",
+    "themes": "themes",
+    "theme": "themes",
     "catalog": "catalog",
     "all": "all",
 }
 
-ALL_RESOURCES = ("shop_profile", "products", "orders", "currencies", "markets")
+ALL_RESOURCES = ("shop_profile", "products", "orders", "currencies", "markets", "themes")
 
 
 def normalize_resources(raw: list[str] | None) -> list[str]:
@@ -138,6 +141,9 @@ def run_admin_shop_sync(
                     protection_product_gid=protection_gid,
                 )
                 results["steps"][res] = {"ok": True}
+            elif res == "themes":
+                stats = sync_themes_full(table, shop_norm, token, api_version)
+                results["steps"][res] = {"ok": True, **stats}
             else:
                 results["steps"][res] = {"ok": False, "error": "unsupported"}
         except Exception as e:

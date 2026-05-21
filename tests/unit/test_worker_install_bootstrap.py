@@ -43,10 +43,12 @@ def test_install_bootstrap_enqueues_catalog_by_default():
         patch("worker_handler._ensure_global_config_seeds"),
         patch("worker_handler.sync_shop_profile"),
         patch("worker_handler._maybe_auto_activate"),
-        patch("worker_handler._enqueue_catalog_sync") as enqueue,
+        patch("worker_handler._enqueue_catalog_sync") as enqueue_catalog,
+        patch("worker_handler._enqueue_theme_sync") as enqueue_theme,
     ):
         run_install_bootstrap(table, "a.myshopify.com", "1001", "kms-key", "2026-04")
-    enqueue.assert_called_once_with("a.myshopify.com", "1001", "2026-04")
+    enqueue_catalog.assert_called_once_with("a.myshopify.com", "1001", "2026-04")
+    enqueue_theme.assert_called_once_with("a.myshopify.com", "1001", "2026-04")
 
 
 def test_install_bootstrap_skips_enqueue_when_disabled():
@@ -62,9 +64,17 @@ def test_install_bootstrap_skips_enqueue_when_disabled():
         patch("worker_handler._ensure_global_config_seeds"),
         patch("worker_handler.sync_shop_profile"),
         patch("worker_handler._maybe_auto_activate"),
-        patch("worker_handler._enqueue_catalog_sync") as enqueue,
+        patch("worker_handler._enqueue_catalog_sync") as enqueue_catalog,
+        patch("worker_handler._enqueue_theme_sync") as enqueue_theme,
     ):
         run_install_bootstrap(
-            table, "a.myshopify.com", "1001", "kms-key", "2026-04", enqueue_catalog=False
+            table,
+            "a.myshopify.com",
+            "1001",
+            "kms-key",
+            "2026-04",
+            enqueue_catalog=False,
+            enqueue_themes=False,
         )
-    enqueue.assert_not_called()
+    enqueue_catalog.assert_not_called()
+    enqueue_theme.assert_not_called()
