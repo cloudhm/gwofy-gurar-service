@@ -97,6 +97,30 @@ query ProductsByHandle($q: String!) {
 }
 """
 
+ONLINE_STORE_CHANNEL_NAME = "Online Store"
+
+PUBLICATIONS_FOR_ONLINE_STORE = """
+query PublicationsForOnlineStore {
+  publications(first: 50) {
+    nodes {
+      id
+      catalog { title }
+      channels(first: 5) {
+        nodes { name }
+      }
+    }
+  }
+}
+"""
+
+PUBLISHABLE_PUBLISH = """
+mutation PublishablePublish($id: ID!, $input: [PublicationInput!]!) {
+  publishablePublish(id: $id, input: $input) {
+    userErrors { field message }
+  }
+}
+"""
+
 def _protection_gql(
     shop: str,
     token: str,
@@ -177,6 +201,65 @@ def _first_product_gid_by_handle(
         if gid:
             return str(gid)
     return None
+
+
+def _online_store_publication_id(
+    shop: str,
+    token: str,
+    api_version: str,
+    *,
+    auth: ShopAdminAuth | None = None,
+) -> str:
+    """Resolve Online Store publication GID (required for in-app product search)."""
+    data = _protection_gql(
+        shop,
+        token,
+        PUBLICATIONS_FOR_ONLINE_STORE,
+        {},
+        api_version,
+        auth=auth,
+        operation="onlineStorePublication",
+    )
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    nodes = (data.get("data", {}).get("publications") or {}).get("nodes") or []
+    target = ONLINE_STORE_CHANNEL_NAME.casefold()
+    for node in nodes:
+        pub_id = node.get("id")
+        if not pub_id:
+            continue
+        catalog = node.get("catalog") or {}
+        if str(catalog.get("title") or "").casefold() == target:
+            return str(pub_id)
+        channels = (node.get("channels") or {}).get("nodes") or []
+        for ch in channels:
+            if str(ch.get("name") or "").casefold() == target:
+                return str(pub_id)
+    raise RuntimeError("online_store_publication_not_found")
+
+
+def _publish_product_to_online_store(
+    shop: str,
+    token: str,
+    api_version: str,
+    product_gid: str,
+    *,
+    auth: ShopAdminAuth | None = None,
+) -> None:
+    """Publish protection product to Online Store so it is searchable in the app."""
+    publication_id = _online_store_publication_id(shop, token, api_version, auth=auth)
+    data = _protection_gql(
+        shop,
+        token,
+        PUBLISHABLE_PUBLISH,
+        {"id": product_gid, "input": [{"publicationId": publication_id}]},
+        api_version,
+        auth=auth,
+        operation="publishProtectionProduct",
+    )
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
+    _err(data, "publishablePublish")
 
 
 def _sync_product_vendor(
@@ -280,6 +363,7 @@ def _create_new_protection_product(
 
     if rest:
         _bulk_create_chunks(shop, token, api_version, pid, rest, auth=auth)
+    _publish_product_to_online_store(shop, token, api_version, pid, auth=auth)
     return pid
 
 
@@ -336,6 +420,7 @@ def _apply_tiers_to_existing_product(
                 raise RuntimeError(str(data["errors"]))
             _err(data, "productVariantsBulkDelete")
 
+    _publish_product_to_online_store(shop, token, api_version, str(pid), auth=auth)
     return str(pid)
 
 
