@@ -449,6 +449,11 @@ class ApiStack(Stack):
             integration=merchant_integ,
         )
         http_api.add_routes(
+            path="/api/install",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=merchant_integ,
+        )
+        http_api.add_routes(
             path="/api/activate",
             methods=[apigwv2.HttpMethod.POST],
             integration=merchant_integ,

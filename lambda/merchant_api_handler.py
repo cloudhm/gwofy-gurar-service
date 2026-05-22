@@ -1,4 +1,4 @@
-"""Merchant Session API: /api/me, activate, embed ack, storefront cart-config (HMAC)."""
+"""Merchant Session API: /api/me, install, activate, embed ack, storefront cart-config (HMAC)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import boto3
+import requests
 
 from lib.activate_app import ActivateAppError, run_activate_app_safe
 from lib.audit import append_audit
@@ -21,16 +22,25 @@ from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
+from lib.shop_install import (
+    enqueue_install_worker_jobs,
+    shop_needs_install_bootstrap,
+    upsert_shop_metadata_from_offline_tokens,
+)
 from lib.shop_offline_access import (
     LOCK_AFTER_CONSECUTIVE_401,
     ShopAdminAuth,
     ShopifyAuth401Error,
     get_fresh_shop_access_token,
     offline_token_recovery_reason,
+    persist_expiring_offline_tokens,
     recover_offline_token_from_session,
     shopify_auth_401_response_body,
 )
-from lib.shopify_api import DEFAULT_API_VERSION
+from lib.shopify_api import (
+    DEFAULT_API_VERSION,
+    exchange_session_token_for_offline_access,
+)
 
 logger = setup_logging("merchant_api")
 
@@ -87,6 +97,10 @@ def handler(event, context):
 
     if method == "GET" and path == "/api/me":
         return _api_me(table, shop_host, payload, headers, req_id)
+    if method == "POST" and path == "/api/install":
+        return _api_install(
+            table, shop_host, token, payload, headers, req_id
+        )
     if method == "POST" and path == "/api/activate":
         return _activate(table, shop_host, payload, headers, req_id)
     if method == "PATCH" and path == "/api/me/embed":
@@ -188,6 +202,111 @@ def _try_recover_offline_token_from_session(
                 },
             )
         return None
+
+
+def _api_install(
+    table,
+    shop_host: str,
+    session_token: str,
+    payload: dict,
+    headers: dict,
+    req_id: str,
+):
+    """
+    Embedded app install: session JWT → offline token pair, persist METADATA, enqueue INITIAL_SYNC.
+
+    Mirrors ``/oauth/callback`` for shops that open the app before OAuth redirect completes.
+    """
+    item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    if item and item.get("plugin_suspended"):
+        return _resp(403, {"error": "plugin_suspended"})
+
+    kms_key_id = os.environ["KMS_KEY_ID"]
+    client_id = os.environ["SHOPIFY_CLIENT_ID"]
+    client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
+    api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)
+    table_name = os.environ["TABLE_NAME"]
+    queue_url = os.environ.get("WORK_QUEUE_URL", "").strip()
+    actor_sub = str(payload.get("sub") or "")
+
+    try:
+        token_resp = exchange_session_token_for_offline_access(
+            shop_host, client_id, client_secret, session_token
+        )
+    except requests.HTTPError:
+        logger.warning("session_install_token_exchange_failed", extra={"shop": shop_host})
+        append_audit(
+            table,
+            shop_host,
+            actor_type="merchant",
+            actor_id=actor_sub,
+            action="INSTALL_SESSION",
+            outcome="failed",
+            detail={"stage": "token_exchange"},
+            http_path="/api/install",
+            request_id=req_id,
+            source_ip=_xff(headers),
+        )
+        return _resp(
+            401,
+            {
+                "error": "session_token_exchange_failed",
+                "hint": "Re-open the app from Shopify Admin so App Bridge issues a fresh session token.",
+            },
+        )
+    except Exception as e:
+        logger.exception("session_install_token_exchange_error", extra={"shop": shop_host})
+        return _resp(
+            502,
+            {"error": "session_token_exchange_failed", "detail": str(e)[:400]},
+        )
+
+    needs_bootstrap = shop_needs_install_bootstrap(item)
+    if needs_bootstrap:
+        if not queue_url:
+            return _resp(500, {"error": "work_queue_not_configured"})
+        store_number = upsert_shop_metadata_from_offline_tokens(
+            table,
+            table_name,
+            shop_host,
+            token_resp,
+            kms_key_id,
+        )
+        enqueue_install_worker_jobs(
+            queue_url=queue_url,
+            shop=shop_host,
+            store_number=store_number,
+            api_version=api_version,
+            source="merchant_api",
+        )
+    else:
+        persist_expiring_offline_tokens(table, shop_host, kms_key_id, token_resp)
+        store_number = str(item.get("store_number") or "")
+
+    row = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item") or {}
+    append_audit(
+        table,
+        shop_host,
+        actor_type="merchant",
+        actor_id=actor_sub,
+        action="INSTALL_SESSION",
+        outcome="ok",
+        detail={"bootstrap_enqueued": needs_bootstrap, "store_number": store_number},
+        http_path="/api/install",
+        request_id=req_id,
+        source_ip=_xff(headers),
+    )
+    return _resp(
+        200,
+        {
+            "ok": True,
+            "shop": shop_host,
+            "store_number": store_number,
+            "installation_status": row.get("installation_status", "ACTIVE"),
+            "activation_status": row.get("activation_status", "UNACTIVATED"),
+            "bootstrap_enqueued": needs_bootstrap,
+        },
+    )
 
 
 def _api_me(table, shop_host: str, payload: dict, headers: dict, req_id: str):

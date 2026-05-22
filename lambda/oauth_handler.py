@@ -4,20 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
 
 import boto3
 
-from lib.kms_tokens import encrypt_refresh_token, encrypt_token
 from lib.logging_json import setup_logging
-from lib.models import GSI2_PK_SHOP_INDEX, SK_METADATA, pk_shop
+from lib.shop_install import enqueue_install_worker_jobs, upsert_shop_metadata_from_offline_tokens
 from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, verify_oauth_hmac
-from lib.store_number import allocate_store_number
 
 logger = setup_logging("oauth")
 
 ddb = boto3.resource("dynamodb")
-sqs = boto3.client("sqs")
 
 
 def _post_install_redirect_location(shop: str, app_client_id: str) -> str:
@@ -56,97 +52,43 @@ def handler(event, context):
         logger.exception("token_exchange_failed")
         return _resp(502, {"error": "token_exchange_failed", "detail": str(e)})
 
-    access_token = token_resp.get("access_token") or ""
-    scopes = token_resp.get("scope") or ""
-
-    store_number = allocate_store_number(table_name, shop)
-    enc = encrypt_token(kms_key_id, access_token)
-
-    table = ddb.Table(table_name)
-    pk = pk_shop(shop)
-    now = datetime.now(timezone.utc).isoformat()
-    now_dt = datetime.now(timezone.utc)
-    prev = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item") or {}
-    installed_at = str(prev.get("installed_at") or now)
-
-    item = {
-        "pk": pk,
-        "sk": SK_METADATA,
-        "shop": shop,
-        "store_number": store_number,
-        "access_token_enc": enc,
-        "scopes": scopes,
-        "installation_status": "ACTIVE",
-        "installed_at": installed_at,
-        "updated_at": now,
-        "kms_key_id": kms_key_id,
-        "oauth_state_last": state,
-        "activation_status": "UNACTIVATED",
-        "return_insurance_status": "CLOSED",
-        "shipping_protection_status": "CLOSED",
-        "plugin_suspended": False,
-        "embed_enabled_ack": False,
-        "gsi2pk": GSI2_PK_SHOP_INDEX,
-        "gsi2sk": f"{installed_at}#{shop}",
-    }
     rt = token_resp.get("refresh_token")
     exp_in = int(token_resp.get("expires_in") or 0)
     rt_exp_in = int(token_resp.get("refresh_token_expires_in") or 0)
-    if isinstance(rt, str) and rt.strip() and exp_in > 0 and rt_exp_in > 0:
-        item["refresh_token_enc"] = encrypt_refresh_token(kms_key_id, rt.strip())
-        item["shopify_offline_access_token_expires_at"] = (
-            now_dt + timedelta(seconds=exp_in)
-        ).isoformat()
-        item["shopify_offline_refresh_token_expires_at"] = (
-            now_dt + timedelta(seconds=rt_exp_in)
-        ).isoformat()
-    else:
+    if not (isinstance(rt, str) and rt.strip() and exp_in > 0 and rt_exp_in > 0):
         logger.warning(
             "oauth_token_response_missing_expiring_fields",
             extra={"shop": shop, "keys": list(token_resp.keys())},
         )
-    for k in (
-        "activation_status",
-        "protection_product_gid",
-        "embed_enabled_ack",
-        "return_insurance_status",
-        "shipping_protection_status",
-        "plugin_suspended",
-        "sp_below_min_coverage_tip",
-        "sp_greater_max_coverage_tip",
-    ):
-        if prev.get(k) is not None:
-            item[k] = prev[k]
 
-    table.put_item(Item=item)
+    table = ddb.Table(table_name)
+    store_number = upsert_shop_metadata_from_offline_tokens(
+        table,
+        table_name,
+        shop,
+        token_resp,
+        kms_key_id,
+        oauth_state_last=state,
+    )
 
     # Webhook topics are declared in shopify.app.toml (app config). Do not register
     # the same topics again via Admin REST here — that duplicates subscriptions when
     # both TOML and OAuth run, causing multiple deliveries per Shopify event.
 
-    internal = {
-        "source": "oauth",
-        "shop": shop,
-        "store_number": store_number,
-        "api_version": api_version,
-    }
-    # APP_INSTALLED first so the worker can notify (e.g. Feishu) before INITIAL_SYNC;
-    # INITIAL_SYNC enqueues CATALOG_SYNC after profile + activation (async product/order pull).
-    r_installed = sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps({**internal, "event": "APP_INSTALLED"}),
-    )
-    r_sync = sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps({**internal, "event": "INITIAL_SYNC"}),
+    msg_ids = enqueue_install_worker_jobs(
+        queue_url=queue_url,
+        shop=shop,
+        store_number=store_number,
+        api_version=api_version,
+        source="oauth",
     )
     logger.info(
         "oauth_work_queue_enqueued",
         extra={
             "shop": shop,
             "store_number": store_number,
-            "initial_sync_sqs_message_id": r_sync.get("MessageId"),
-            "app_installed_sqs_message_id": r_installed.get("MessageId"),
+            "initial_sync_sqs_message_id": msg_ids.get("initial_sync_message_id"),
+            "app_installed_sqs_message_id": msg_ids.get("app_installed_message_id"),
         },
     )
 

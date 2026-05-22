@@ -95,7 +95,7 @@ def _job_summary(body: dict[str, Any]) -> dict[str, Any]:
 
 def _oauth_install_job_sort_key(body: dict[str, Any]) -> int:
     """Within one Lambda invocation, run lightweight install jobs before INITIAL_SYNC."""
-    if body.get("source") != "oauth":
+    if body.get("source") not in ("oauth", "merchant_api"):
         return 100
     ev = body.get("event")
     if ev == "APP_INSTALLED":
@@ -173,7 +173,7 @@ def handler(event, context):
 
 def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str, feishu_url: str) -> None:
     src = body.get("source")
-    if src == "oauth":
+    if src in ("oauth", "merchant_api"):
         ev = body.get("event")
         shop = body["shop"]
         store_number = body["store_number"]
@@ -187,6 +187,7 @@ def route_message(table, body: dict[str, Any], kms_key_id: str, api_version: str
             send_text(
                 feishu_url,
                 f"[Gwofy] App installed\nshop={shop}\nstore_number={store_number}\n"
+                f"source={src}\n"
                 f"time={datetime.now(timezone.utc).isoformat()}",
             )
         return
