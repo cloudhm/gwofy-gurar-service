@@ -473,6 +473,11 @@ class ApiStack(Stack):
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PUT],
             integration=merchant_integ,
         )
+        http_api.add_routes(
+            path="/api/me/app-config",
+            methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.PATCH],
+            integration=merchant_integ,
+        )
 
         admin_integ = apigwv2_integrations.HttpLambdaIntegration("AdminInteg", admin_fn)
         # Do not bind OPTIONS here: JWT authorizer rejects unauthenticated preflight. With CORS

@@ -15,10 +15,18 @@ from lib.audit import append_audit
 from lib.cart_config_response import build_cart_plugin_response
 from lib.shipping_country_defaults import is_country_supported
 from lib.logging_json import setup_logging
+from lib.merchant_app_config import (
+    ALLOWED_KEYS as APP_CONFIG_ALLOWED_KEYS,
+    merge_app_config,
+    normalize_for_storage as normalize_app_config_for_storage,
+    parse_app_config_from_meta,
+    should_remove_storage,
+    validate_patch as validate_app_config_patch,
+)
 from lib.merchant_premium_rules import normalize_for_storage, parse_rules_from_meta, validate_rules
 from lib.embed_deep_link import build_embed_deep_link, resolve_main_theme_gid
 from lib.theme_sync import fetch_main_theme_gid, update_main_theme_gid_metadata
-from lib.models import MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
+from lib.models import MERCHANT_APP_CONFIG_JSON, MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
 from lib.storefront_auth import verify_shop_body_hmac
@@ -111,6 +119,10 @@ def handler(event, context):
         return _get_merchant_premium_rules(table, shop_host, payload, headers, req_id)
     if method == "PUT" and path == "/api/me/merchant-premium-rules":
         return _put_merchant_premium_rules(event, table, shop_host, payload, headers, req_id)
+    if method == "GET" and path == "/api/me/app-config":
+        return _get_merchant_app_config(table, shop_host, payload, headers, req_id)
+    if method == "PATCH" and path == "/api/me/app-config":
+        return _patch_merchant_app_config(event, table, shop_host, payload, headers, req_id)
 
     return _resp(404, {"error": "not_found"})
 
@@ -647,6 +659,80 @@ def _put_merchant_premium_rules(event, table, shop_host: str, payload: dict, hea
         source_ip=_xff(headers),
     )
     return _resp(200, {"ok": True})
+
+
+def _get_merchant_app_config(table, shop_host: str, payload: dict, headers: dict, req_id: str):
+    item, err = _require_merchant_shop_active(
+        table,
+        shop_host,
+        payload,
+        headers,
+        req_id,
+        http_path="/api/me/app-config",
+        audit_action="MERCHANT_APP_CONFIG_GET",
+    )
+    if err:
+        return err
+    return _resp(200, {"appConfig": parse_app_config_from_meta(item)})
+
+
+def _patch_merchant_app_config(event, table, shop_host: str, payload: dict, headers: dict, req_id: str):
+    item, err = _require_merchant_shop_active(
+        table,
+        shop_host,
+        payload,
+        headers,
+        req_id,
+        http_path="/api/me/app-config",
+        audit_action="MERCHANT_APP_CONFIG_PATCH",
+    )
+    if err:
+        return err
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    patch, verr = validate_app_config_patch(body)
+    if verr:
+        err_body: dict = {"error": "invalid_app_config"}
+        if verr == "invalid_keys":
+            err_body["allowed"] = sorted(APP_CONFIG_ALLOWED_KEYS.keys())
+        else:
+            err_body["detail"] = verr
+        return _resp(400, err_body)
+    existing = parse_app_config_from_meta(item)
+    merged = merge_app_config(existing, patch)
+    now = datetime.now(timezone.utc).isoformat()
+    if should_remove_storage(merged):
+        table.update_item(
+            Key={"pk": pk_shop(shop_host), "sk": SK_METADATA},
+            UpdateExpression="REMOVE #ac SET #u = :u",
+            ExpressionAttributeNames={"#ac": MERCHANT_APP_CONFIG_JSON, "#u": "updated_at"},
+            ExpressionAttributeValues={":u": now},
+        )
+    else:
+        table.update_item(
+            Key={"pk": pk_shop(shop_host), "sk": SK_METADATA},
+            UpdateExpression="SET #ac = :ac, #u = :u",
+            ExpressionAttributeNames={"#ac": MERCHANT_APP_CONFIG_JSON, "#u": "updated_at"},
+            ExpressionAttributeValues={
+                ":ac": normalize_app_config_for_storage(merged),
+                ":u": now,
+            },
+        )
+    append_audit(
+        table,
+        shop_host,
+        actor_type="merchant",
+        actor_id=str(payload.get("sub") or ""),
+        action="MERCHANT_APP_CONFIG_PATCH",
+        outcome="ok",
+        detail={"patch": {k: ("removed" if v is None else "set") for k, v in patch.items()}},
+        http_path="/api/me/app-config",
+        request_id=req_id,
+        source_ip=_xff(headers),
+    )
+    return _resp(200, {"ok": True, "appConfig": merged})
 
 
 def _sync_shop_currencies(table, shop_host: str, payload: dict, headers: dict, req_id: str):
