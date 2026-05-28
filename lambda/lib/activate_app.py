@@ -15,7 +15,8 @@ from .pricing_config import (
     get_supported_currencies,
     tier_native_amount,
 )
-from .protection_product import upsert_protection_product
+from .models import META_PROTECTION_PRODUCT_HANDLE
+from .protection_product import product_handle_by_gid, upsert_protection_product
 from .shop_offline_access import ShopAdminAuth
 
 DEFAULT_TITLE = "Shipping Protection"
@@ -116,16 +117,23 @@ def run_activate_app(
         handle=PROTECTION_PRODUCT_HANDLE,
         auth=auth,
     )
+    product_handle = (
+        product_handle_by_gid(shop_norm, token, api_version, pid, auth=auth)
+        or PROTECTION_PRODUCT_HANDLE
+    )
     now = datetime.now(timezone.utc).isoformat()
     table.update_item(
         Key={"pk": pk_shop(shop_norm), "sk": SK_METADATA},
         UpdateExpression=(
-            "SET activation_status = :a, protection_product_gid = :p, updated_at = :u "
+            "SET activation_status = :a, protection_product_gid = :p, "
+            "#ph = :ph, updated_at = :u "
             "REMOVE last_activation_error, last_fx_usd_to_shop, last_fx_as_of, last_fx_target_ccy"
         ),
+        ExpressionAttributeNames={"#ph": META_PROTECTION_PRODUCT_HANDLE},
         ExpressionAttributeValues={
             ":a": "ACTIVATED",
             ":p": pid,
+            ":ph": product_handle,
             ":u": now,
         },
     )

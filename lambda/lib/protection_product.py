@@ -84,6 +84,14 @@ query ProductByIdExists($id: ID!) {
 }
 """
 
+PRODUCT_HANDLE_BY_ID = """
+query ProductHandleById($id: ID!) {
+  product(id: $id) {
+    handle
+  }
+}
+"""
+
 PRODUCTS_BY_HANDLE = """
 query ProductsByHandle($q: String!) {
   products(first: 5, query: $q) {
@@ -177,6 +185,33 @@ def _product_id_exists(shop: str, token: str, api_version: str, product_gid: str
         raise RuntimeError(str(data["errors"]))
     p = data.get("data", {}).get("product")
     return bool(p and p.get("id"))
+
+
+def product_handle_by_gid(
+    shop: str,
+    token: str,
+    api_version: str,
+    product_gid: str,
+    *,
+    auth: ShopAdminAuth | None = None,
+) -> str | None:
+    """Read Shopify product handle for activation / storefront config."""
+    gid = (product_gid or "").strip()
+    if not gid:
+        return None
+    data = _protection_gql(
+        shop,
+        token,
+        PRODUCT_HANDLE_BY_ID,
+        {"id": gid},
+        api_version,
+        auth=auth,
+    )
+    if data.get("errors"):
+        return None
+    product = (data.get("data") or {}).get("product") or {}
+    handle = str(product.get("handle") or "").strip()
+    return handle or None
 
 
 def _first_product_gid_by_handle(

@@ -29,6 +29,17 @@ from lib.theme_sync import fetch_main_theme_gid, update_main_theme_gid_metadata
 from lib.models import MERCHANT_APP_CONFIG_JSON, MERCHANT_PREMIUM_RULES_JSON, SK_METADATA, pk_shop
 from lib.session_jwt import shop_host_from_payload, verify_session_token
 from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync_shop_enabled_currencies
+from lib.static_assets import (
+    APP_CONFIG_VERSION,
+    APP_STOREFRONT_VERSION,
+    get_app_config_js_for_shop,
+    get_app_storefront_asset,
+)
+from lib.storefront_gwofy_config import (
+    build_effective_gwofy_config,
+    is_valid_shop_host,
+    shop_query_from_event,
+)
 from lib.storefront_auth import verify_shop_body_hmac
 from lib.shop_install import (
     enqueue_install_worker_jobs,
@@ -76,6 +87,12 @@ def handler(event, context):
     headers = _headers(event)
     table_name = os.environ["TABLE_NAME"]
     table = ddb.Table(table_name)
+
+    if method in ("GET", "HEAD") and path == "/static/app-storefront.js":
+        return _serve_app_storefront_js(method, headers)
+
+    if method in ("GET", "HEAD") and path == "/static/app-config.js":
+        return _serve_app_config_js(event, method, headers, table)
 
     if method == "POST" and path == "/api/cart-config":
         return _cart_config(event, table, req_id)
@@ -842,6 +859,69 @@ def _cart_config(event, table, req_id: str):
         source_ip=_xff(headers),
     )
     return _resp(200, payload)
+
+
+def _etag_matches(if_none_match: str, etag: str) -> bool:
+    if not if_none_match or not etag:
+        return False
+    for part in if_none_match.split(","):
+        token = part.strip().strip('"')
+        if token == etag:
+            return True
+    return False
+
+
+def _serve_app_storefront_js(method: str, headers: dict[str, str]):
+    body_bytes, etag, version = get_app_storefront_asset()
+    inm = headers.get("if-none-match") or ""
+    if _etag_matches(inm, etag):
+        return _js_resp(304, etag=etag, version=version)
+    if method == "HEAD":
+        return _js_resp(200, etag=etag, version=version)
+    return _js_resp(200, body=body_bytes.decode("utf-8"), etag=etag, version=version)
+
+
+def _serve_app_config_js(event, method: str, headers: dict[str, str], table):
+    shop_host = shop_query_from_event(event)
+    if not shop_host:
+        return _resp(400, {"error": "missing_shop"})
+    if not is_valid_shop_host(shop_host):
+        return _resp(400, {"error": "invalid_shop_host"})
+
+    item = table.get_item(Key={"pk": pk_shop(shop_host), "sk": SK_METADATA}).get("Item")
+    if not item:
+        return _resp(404, {"error": "shop_not_found"})
+    if str(item.get("activation_status") or "") != "ACTIVATED":
+        return _resp(403, {"error": "shop_not_activated"})
+
+    merged = build_effective_gwofy_config(
+        table, item, shop_host, storefront_js_version=APP_STOREFRONT_VERSION
+    )
+    updated_at = str(item.get("updated_at") or "")
+    body, etag = get_app_config_js_for_shop(merged, shop_host, updated_at)
+    if method == "HEAD":
+        return _js_resp(200, etag=etag, version=APP_CONFIG_VERSION, cache_control=None)
+    return _js_resp(200, body=body, etag=etag, version=APP_CONFIG_VERSION, cache_control=None)
+
+
+def _js_resp(
+    code: int,
+    *,
+    body: str = "",
+    etag: str = "",
+    version: str = "",
+    cache_control: str | None = "public, max-age=3600, must-revalidate",
+):
+    hdrs = {
+        "Content-Type": "application/javascript; charset=utf-8",
+    }
+    if cache_control is not None:
+        hdrs["Cache-Control"] = cache_control
+    if etag:
+        hdrs["ETag"] = f'"{etag}"'
+    if version:
+        hdrs["X-Gwofy-Asset-Version"] = version
+    return {"statusCode": code, "headers": hdrs, "body": body}
 
 
 def _resp(code: int, body: dict):

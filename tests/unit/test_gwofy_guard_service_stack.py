@@ -44,6 +44,8 @@ def test_api_stack_wires_http_api():
     # Six app Lambdas: OAuth, Webhook, Worker, Merchant API, Admin API, Reconcile
     template.resource_count_is("AWS::Lambda::Function", 7)
     template.resource_count_is("AWS::Cognito::UserPool", 0)
+    # Reconcile (daily) + Lambda warmup (every 5 minutes)
+    template.resource_count_is("AWS::Events::Rule", 2)
 
 
 def test_api_stack_requires_admin_cognito_user_pool_id():

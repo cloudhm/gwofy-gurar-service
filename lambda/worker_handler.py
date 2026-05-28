@@ -11,6 +11,7 @@ from typing import Any
 import boto3
 
 from lib.activate_app import ActivateAppError, run_activate_app_safe
+from lib.lambda_warmup import is_warmup_event
 from lib.admin_shop_sync import run_admin_shop_sync
 from lib.customer_order_sync import fetch_merged_order_node, sync_orders
 from lib.feishu import send_text
@@ -122,6 +123,10 @@ def _sort_worker_sqs_records(records: list[dict[str, Any]]) -> list[dict[str, An
 
 
 def handler(event, context):
+    if is_warmup_event(event):
+        logger.info("lambda_warmup")
+        return {"batchItemFailures": []}
+
     table_name = os.environ["TABLE_NAME"]
     kms_key_id = os.environ["KMS_KEY_ID"]
     api_version = os.environ.get("SHOPIFY_API_VERSION", DEFAULT_API_VERSION)

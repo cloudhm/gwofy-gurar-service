@@ -1,0 +1,205 @@
+{
+  "debug": false,
+  "auth": {
+    "isOpenForSP": true
+  },
+  "isCartDefaultOpen": false,
+  "shopId": "",
+  "productHandle": "GWOFY-SHIPPING-PROTECTION-QAQWER",
+  "shopifyPluginVersion": 1,
+  "remoteScriptUrls": [],
+  "assets": {
+    "spMoreUrl": "javascript:void(0);",
+    "spServiceUrl": "javascript:void(0);"
+  },
+  "widgetThemeStyle": "white",
+  "tipsDialogAssets": {
+    "bgImage": "//sslstaticus.xcottons.com/shopify-plugins/xmh-idc/imgs/icon_bg_white_b6c2313aa963ddf1.webp"
+  },
+  "widgetAssets": {
+    "titleIconBlack": "data:image/svg+xml,%3Csvg%20height%3D%2216%22%20viewBox%3D%220%200%2015%2016%22%20width%3D%2215%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cg%20fill%3D%22none%22%20fill-rule%3D%22evenodd%22%3E%3Cpath%20d%3D%22m0%200h15v16h-15z%22%2F%3E%3Cg%20fill%3D%22%23000%22%20fill-rule%3D%22nonzero%22%20transform%3D%22translate%282%202.5%29%22%3E%3Cpath%20d%3D%22m0%200h11v11h-11z%22%20opacity%3D%220%22%2F%3E%3Cpath%20d%3D%22m10.3286133%201.80146484-4.4676758-1.6671875c-.11601563-.04296875-.23847656-.06445312-.35986328-.06445312-.12246094%200-.24492188.02148437-.36201172.06552734l-4.46982422%201.67578125c-.40283203.15146485-.66923828.53603516-.66923828.96572266v4.6524414c0%20.38027344.20839844.72939454.54355469.90878907l4.4859375%202.40947266c.15253906.0816406.32011719.1224609.48769531.1224609.15791016%200%20.31582031-.0365234.46083984-.1084961l4.45156246-2.22578121c.3491211-.17509766.5704102-.53173828.5704102-.92275391v-4.84472656c0-.43076172-.2674805-.81640625-.6713867-.96679688zm-4.9489258-1.02265625c.03867188-.01396484.07949219-.02148437.1203125-.02148437s.08164063.00751953.1203125.02148437l3.92734375%201.46523438c.11279297.04189453.11171875.20195312-.00107422.24169922l-1.25361328.44902344c-.03974609.01396484-.08378906.01289062-.12353516-.00322266l-3.95419921-1.63603516c-.03652344-.01503906-.03544922-.06660156.00107421-.07949218zm-.2234375%208.82470704c0%20.19550781-.20839844.31904296-.38027344.22666015l-3.90693359-2.09794922c-.11171875-.06015625-.18154297-.17617187-.18154297-.30292968v-4.12070313c0-.17832031.17617188-.30292969.34482422-.24277344l3.78232422%201.35029297c.20517578.07304688.34267578.26748047.34267578.48554688v4.70185547zm-.00322266-5.79541016-3.68886718-1.31806641c-.11279297-.04082031-.11494141-.19980469-.00214844-.24169922l1.64570312-.61767578c.04082032-.01503906.0859375-.01503906.1256836.00214844l3.92841797%201.62529297c.03652343.01503906.03544921.06660156-.00214844.08056641l-1.31376953.46943359c-.2234375.08056641-.46835938.08056641-.6928711%200zm5.15947266%203.80488281c0%20.13105469-.0730469.24921875-.1901367.30722656l-3.90585939%201.95292969c-.17080078.0859375-.37275391-.03867187-.37275391-.23095703v-4.73945312c0-.21806641.1375-.4125.34267578-.48554688l1.49101563-.5328125c.02792968-.00966797.05693359.01074219.05693359.04082031v2.12373047c0%20.06337891.06767578.10527344.12460937.07734375l.46835938-.23417969c.05800781-.0290039.09453125-.08916015.09453125-.15361328v-1.99804687c0-.07304688.04619141-.1375.11386719-.16220703l1.43193359-.51132813c.16757812-.06015625.34482422.06445313.34482422.24277344z%22%2F%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fsvg%3E",
+    "titleIconWhite": "data:image/svg+xml,%3Csvg%20height%3D%2216%22%20viewBox%3D%220%200%2015%2016%22%20width%3D%2215%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cg%20fill%3D%22none%22%20fill-rule%3D%22evenodd%22%3E%3Cpath%20d%3D%22m0%200h15v16h-15z%22%2F%3E%3Cg%20fill%3D%22%23dedede%22%20fill-rule%3D%22nonzero%22%20transform%3D%22translate%282%202.5%29%22%3E%3Cpath%20d%3D%22m0%200h11v11h-11z%22%20opacity%3D%220%22%2F%3E%3Cpath%20d%3D%22m10.3286133%201.80146484-4.4676758-1.6671875c-.11601563-.04296875-.23847656-.06445312-.35986328-.06445312-.12246094%200-.24492188.02148437-.36201172.06552734l-4.46982422%201.67578125c-.40283203.15146485-.66923828.53603516-.66923828.96572266v4.6524414c0%20.38027344.20839844.72939454.54355469.90878907l4.4859375%202.40947266c.15253906.0816406.32011719.1224609.48769531.1224609.15791016%200%20.31582031-.0365234.46083984-.1084961l4.45156246-2.22578121c.3491211-.17509766.5704102-.53173828.5704102-.92275391v-4.84472656c0-.43076172-.2674805-.81640625-.6713867-.96679688zm-4.9489258-1.02265625c.03867188-.01396484.07949219-.02148437.1203125-.02148437s.08164063.00751953.1203125.02148437l3.92734375%201.46523438c.11279297.04189453.11171875.20195312-.00107422.24169922l-1.25361328.44902344c-.03974609.01396484-.08378906.01289062-.12353516-.00322266l-3.95419921-1.63603516c-.03652344-.01503906-.03544922-.06660156.00107421-.07949218zm-.2234375%208.82470704c0%20.19550781-.20839844.31904296-.38027344.22666015l-3.90693359-2.09794922c-.11171875-.06015625-.18154297-.17617187-.18154297-.30292968v-4.12070313c0-.17832031.17617188-.30292969.34482422-.24277344l3.78232422%201.35029297c.20517578.07304688.34267578.26748047.34267578.48554688v4.70185547zm-.00322266-5.79541016-3.68886718-1.31806641c-.11279297-.04082031-.11494141-.19980469-.00214844-.24169922l1.64570312-.61767578c.04082032-.01503906.0859375-.01503906.1256836.00214844l3.92841797%201.62529297c.03652343.01503906.03544921.06660156-.00214844.08056641l-1.31376953.46943359c-.2234375.08056641-.46835938.08056641-.6928711%200zm5.15947266%203.80488281c0%20.13105469-.0730469.24921875-.1901367.30722656l-3.90585939%201.95292969c-.17080078.0859375-.37275391-.03867187-.37275391-.23095703v-4.73945312c0-.21806641.1375-.4125.34267578-.48554688l1.49101563-.5328125c.02792968-.00966797.05693359.01074219.05693359.04082031v2.12373047c0%20.06337891.06767578.10527344.12460937.07734375l.46835938-.23417969c.05800781-.0290039.09453125-.08916015.09453125-.15361328v-1.99804687c0-.07304688.04619141-.1375.11386719-.16220703l1.43193359-.51132813c.16757812-.06015625.34482422.06445313.34482422.24277344z%22%2F%3E%3C%2Fg%3E%3C%2Fg%3E%3C%2Fsvg%3E",
+    "tipsIconLight": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAMAAABhq6zVAAAARVBMVEUAAACLi4uLi4uKioqKioqAgICJiYmLi4vx8fHR0dHAwMD5+fnMzMzGxsa4uLitra2mpqaioqKbm5uOjo7z8/Pk5OSysrI6lzcWAAAAB3RSTlMA8s3HawYaGJvSogAAAGBJREFUCNdVjkkSxDAIA3HAaduTZbL+/6kB55Q+IaAkiUg2TUktizMOdIbR9z4v5ZxcZTHYfv+9rGCi0CrUBioJjiOOkELAXhohFGeuEG+Gc6841q25ZsL6DZ2WHvqp8wAoVAPF+IMo/wAAAABJRU5ErkJggg==",
+    "tipsIconDark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAwAAAAMCAMAAABhq6zVAAAAUVBMVEUAAACysrKysrKysrKqqqqzs7OxsbGwsLCysrJhYWFFRUUUFBStra2Pj49ra2tWVlZOTk4ICAibm5uXl5eJiYmGhoaAgIB8fHx2dnYoKCgRERGlfQlPAAAACHRSTlMA8s3HBmsaa7nheeYAAABiSURBVAjXVY5JEsMwCASREU5LcmxnX/7/0Ey4uU80VM1gZjW8FI9qYp5Ipll7zev47rJqAefL4zZeEObQOvQGbgWWRcc7FIm4jsZfHLF1hFsg3k/EKaP5bGR0lu5rlh7e+QFJKQQxakloSwAAAABJRU5ErkJggg=="
+  },
+  "pricing": {
+    "calcRate": "0.04",
+    "hardMaxAmount": "13000",
+    "spMaxCoverage": "13000",
+    "spMinCoverage": "0",
+    "spGreaterMaxCoverAgeTip": "Sorry, you cannot purchase Shipping Protection for this order as the total amount exceeds the limit of {{ amount }}",
+    "spBelowMinCoverageTip": "Sorry, Shipping Protection is unavailable for orders under {{ amount }}"
+  },
+  "text": {
+    "sp": {
+      "title": "Shipping Protection",
+      "desc": "Full refund for lost, damaged or delayed package."
+    }
+  },
+  "copy": {
+    "checkoutWithout": "Checkout without protection",
+    "moneyLine": "{{ symbol }}{{ amount }}"
+  },
+  "spVersion": {
+    "popup": "SP-DL-5",
+    "faqUrl": "javascript:void(0);",
+    "terms": "javascript:void(0);"
+  },
+  "tipsDialog": {
+    "title": [
+      "Stay covered.",
+      "Stay confident."
+    ],
+    "slogan": [
+      "Shipping Protection",
+      "Gives you Peace of Mind"
+    ],
+    "benefits": [
+      {
+        "title": "Coverage includes：",
+        "list": [
+          "Loss and damage in transit",
+          "Theft/Porch Piracy",
+          "Mis-delivery by courier",
+          "USD$5 compensation for delay"
+        ]
+      },
+      {
+        "title": "Smooth Claims",
+        "list": [
+          "One click to file, speedy claims guaranteed."
+        ]
+      }
+    ],
+    "coverNowText": "Cover My Order Now",
+    "legalLine": "Visit the {{ faq }} and {{ terms }}",
+    "faqLabel": "FAQ",
+    "termsLabel": "Terms & Conditions"
+  },
+  "supportedCurrencies": [
+    "USD",
+    "CNY"
+  ],
+  "supportedLocales": [
+    {
+      "languageISO": "en",
+      "languageName": "English",
+      "languageExtISO": "en-US",
+      "languageZHName": "英语（美国）"
+    },
+    {
+      "languageISO": "en",
+      "languageName": "English",
+      "languageExtISO": "en-CA",
+      "languageZHName": "英语（加拿大）"
+    },
+    {
+      "languageISO": "fr",
+      "languageName": "Français",
+      "languageExtISO": "fr-CA",
+      "languageZHName": "法语（加拿大）"
+    }
+  ],
+  "spDisableCheck": false,
+  "currencySymbols": {
+    "USD": {
+      "CNameEn": "USD",
+      "CSymbol": "$"
+    },
+    "CAD": {
+      "CNameEn": "CAD",
+      "CSymbol": "$"
+    },
+    "EUR": {
+      "CNameEn": "EUR",
+      "CSymbol": "€"
+    },
+    "GBP": {
+      "CNameEn": "GBP",
+      "CSymbol": "£"
+    },
+    "JPY": {
+      "CNameEn": "JPY",
+      "CSymbol": "¥"
+    },
+    "AUD": {
+      "CNameEn": "AUD",
+      "CSymbol": "$"
+    },
+    "AED": {
+      "CNameEn": "AED",
+      "CSymbol": "د.إ"
+    },
+    "SAR": {
+      "CNameEn": "SAR",
+      "CSymbol": "﷼"
+    },
+    "BHD": {
+      "CNameEn": "BHD",
+      "CSymbol": ".د.ب"
+    },
+    "KWD": {
+      "CNameEn": "KWD",
+      "CSymbol": "د.ك"
+    },
+    "BRL": {
+      "CNameEn": "BRL",
+      "CSymbol": "R$"
+    },
+    "DKK": {
+      "CNameEn": "DKK",
+      "CSymbol": "kr"
+    },
+    "SEK": {
+      "CNameEn": "SEK",
+      "CSymbol": "kr"
+    },
+    "PLN": {
+      "CNameEn": "PLN",
+      "CSymbol": "zł"
+    },
+    "NOK": {
+      "CNameEn": "NOK",
+      "CSymbol": "kr"
+    }
+  },
+  "themeSelectors": {
+    "cartDrawer": {
+      "widgetAnchor": {
+        "selector": "#cart-drawer .cart-drawer__checkout-buttons",
+        "position": "before"
+      },
+      "checkoutBtn": {
+        "query": "#cart-drawer .cart-drawer__checkout-buttons button[name=\"checkout\"]",
+        "noCheckoutProps": [
+          "name"
+        ],
+        "display": "inline-block"
+      },
+      "checkoutWithout": {
+        "selector": "#cart-drawer .cart-drawer__checkout-buttons",
+        "position": "after"
+      }
+    },
+    "cartPage": {
+      "widgetAnchor": {
+        "selector": ".cart__ctas",
+        "position": "before"
+      },
+      "checkoutBtn": {
+        "query": ".cart__ctas button[name=\"checkout\"]",
+        "noCheckoutProps": [
+          "name"
+        ],
+        "display": "inline-block"
+      },
+      "checkoutWithout": {
+        "selector": ".cart__ctas",
+        "position": "after"
+      }
+    },
+    "checkoutMode": "inline",
+    "checkoutPriceSeparator": " • ",
+    "checkoutLine": "{{ label }}{{ separator }}{{ price }}"
+  }
+}

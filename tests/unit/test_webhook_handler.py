@@ -1,8 +1,26 @@
+import json
 import os
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-east-1")
 
-from webhook_handler import _request_snapshot, _utf8_body_for_log
+from webhook_handler import _request_snapshot, _utf8_body_for_log, handler
+from lib.lambda_warmup import WARMUP_EVENT_SOURCE
+
+
+def test_webhook_handler_warmup_returns_ok_without_side_effects(monkeypatch):
+    monkeypatch.setenv("SHOPIFY_CLIENT_SECRET", "test-secret")
+    monkeypatch.setenv("WORK_QUEUE_URL", "https://example.com/queue")
+
+    def _fail_send(*_a, **_k):
+        raise AssertionError("sqs should not be called on warmup")
+
+    monkeypatch.setattr("webhook_handler.sqs.send_message", _fail_send)
+
+    out = handler({"source": WARMUP_EVENT_SOURCE}, None)
+    assert out["statusCode"] == 200
+    body = json.loads(out["body"])
+    assert body["ok"] is True
+    assert body["warmup"] is True
 
 
 def test_utf8_body_for_log_short_body():

@@ -29,8 +29,19 @@ from lib.models import (
     META_SP_GREATER_MAX_COVERAGE_TIP,
     SK_AUDIT_PREFIX,
     SK_METADATA,
+    STOREFRONT_CONFIG_JSON,
     pk_shop,
     pk_tenant,
+)
+from lib.static_assets import APP_STOREFRONT_VERSION
+from lib.storefront_gwofy_config import (
+    config_layers_for_admin,
+    merge_storefront_config_patch,
+    normalize_storefront_config_for_storage,
+    parse_storefront_config_from_meta,
+    should_remove_storefront_config_storage,
+    derived_readonly_keys_in_patch,
+    validate_storefront_config_patch,
 )
 from lib.activity_config import get_activity_info, put_activity_info
 from lib.tips_config import get_tips_info, put_tips_info
@@ -202,6 +213,12 @@ def handler(event, context):
 
     if method == "PUT" and len(parts) == 4 and parts[3] == "calc-coverage-tips":
         return _put_shop_calc_coverage_tips(event, table, shop, actor_sub, actor_email, req_id)
+
+    if method == "GET" and len(parts) == 4 and parts[3] == "storefront-config":
+        return _get_shop_storefront_config(table, shop, actor_sub, req_id)
+
+    if method == "PUT" and len(parts) == 4 and parts[3] == "storefront-config":
+        return _put_shop_storefront_config(event, table, shop, actor_sub, actor_email, req_id)
 
     if method == "POST" and len(parts) == 5 and parts[3] == "features" and parts[4] == "return-insurance":
         return _feature_return(event, table, shop, actor_sub, actor_email, req_id)
@@ -473,6 +490,90 @@ def _put_shop_calc_coverage_tips(event, table, shop: str, actor_sub: str, actor_
         request_id=req_id,
     )
     return _resp(200, {"ok": True})
+
+
+def _get_shop_storefront_config(table, shop: str, actor_sub: str, req_id: str):
+    pk = pk_shop(shop)
+    meta = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_STOREFRONT_CONFIG_READ",
+        outcome="ok",
+        resource="storefront_config",
+        http_path=f"/admin/shops/{shop}/storefront-config",
+        request_id=req_id,
+    )
+    return _resp(
+        200,
+        config_layers_for_admin(table, meta, shop, storefront_js_version=APP_STOREFRONT_VERSION),
+    )
+
+
+def _put_shop_storefront_config(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
+    pk = pk_shop(shop)
+    meta = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item")
+    if not meta:
+        return _resp(404, {"error": "not_found"})
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid_json"})
+    patch, verr = validate_storefront_config_patch(body)
+    if verr:
+        err_body: dict = {"error": "invalid_storefront_config"}
+        if verr == "derived_readonly_keys":
+            err_body["detail"] = derived_readonly_keys_in_patch(body)
+        else:
+            err_body["detail"] = verr
+        return _resp(400, err_body)
+    existing = parse_storefront_config_from_meta(meta)
+    merged = merge_storefront_config_patch(existing, patch)
+    now = datetime.now(timezone.utc).isoformat()
+    if should_remove_storefront_config_storage(merged):
+        table.update_item(
+            Key={"pk": pk, "sk": SK_METADATA},
+            UpdateExpression="REMOVE #sc SET updated_at = :u",
+            ExpressionAttributeNames={"#sc": STOREFRONT_CONFIG_JSON},
+            ExpressionAttributeValues={":u": now},
+        )
+    else:
+        table.update_item(
+            Key={"pk": pk, "sk": SK_METADATA},
+            UpdateExpression="SET #sc = :sc, updated_at = :u",
+            ExpressionAttributeNames={"#sc": STOREFRONT_CONFIG_JSON},
+            ExpressionAttributeValues={
+                ":sc": normalize_storefront_config_for_storage(merged),
+                ":u": now,
+            },
+        )
+    append_audit(
+        table,
+        shop,
+        actor_type="admin",
+        actor_id=actor_sub,
+        action="ADMIN_STOREFRONT_CONFIG_UPDATE",
+        outcome="ok",
+        resource="storefront_config",
+        actor_email=actor_email or None,
+        detail={"patch_keys": sorted(patch.keys())},
+        http_path=f"/admin/shops/{shop}/storefront-config",
+        request_id=req_id,
+    )
+    refreshed = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item") or meta
+    return _resp(
+        200,
+        {
+            "ok": True,
+            **config_layers_for_admin(
+                table, refreshed, shop, storefront_js_version=APP_STOREFRONT_VERSION
+            ),
+        },
+    )
 
 
 def _put_tips_info(event, table, actor_sub: str, actor_email: str, req_id: str):

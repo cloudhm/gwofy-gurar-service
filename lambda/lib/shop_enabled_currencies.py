@@ -30,6 +30,17 @@ query ShopEnabledCurrencies {
 """
 
 
+def shop_supported_currencies_list(meta: dict[str, Any]) -> list[str]:
+    """Shopify-enabled presentment currencies for storefront GWOFY_CONFIG; else shop currency or USD."""
+    enabled = parse_shop_enabled_currencies_json(meta)
+    if enabled:
+        return sorted(enabled)
+    primary = normalize_currency_code(str(meta.get("shop_currency_code") or ""))
+    if primary in ALLOWED_PRICING_CURRENCIES:
+        return [primary]
+    return ["USD"]
+
+
 def parse_shop_enabled_currencies_json(meta: dict[str, Any]) -> frozenset[str]:
     raw = meta.get("shop_enabled_currencies_json")
     if not isinstance(raw, str):

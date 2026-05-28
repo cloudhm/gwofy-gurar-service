@@ -7,6 +7,7 @@ import os
 
 import boto3
 
+from lib.lambda_warmup import is_warmup_event
 from lib.logging_json import setup_logging
 from lib.shop_install import enqueue_install_worker_jobs, upsert_shop_metadata_from_offline_tokens
 from lib.shopify_api import DEFAULT_API_VERSION, exchange_token, verify_oauth_hmac
@@ -25,6 +26,9 @@ def _post_install_redirect_location(shop: str, app_client_id: str) -> str:
 
 
 def handler(event, context):
+    if is_warmup_event(event):
+        return _resp(200, {"ok": True, "warmup": True})
+
     params = event.get("queryStringParameters") or {}
     # Also support body for POST callbacks if configured
     qs = {k: v[0] if isinstance(v, list) else v for k, v in params.items()}

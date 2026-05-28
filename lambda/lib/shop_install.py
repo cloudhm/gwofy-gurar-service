@@ -15,6 +15,7 @@ from .store_number import allocate_store_number
 _PRESERVE_FROM_PREV = (
     "activation_status",
     "protection_product_gid",
+    "protection_product_handle",
     "embed_enabled_ack",
     "return_insurance_status",
     "shipping_protection_status",

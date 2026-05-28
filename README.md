@@ -192,6 +192,8 @@ jobs:
 
    **Webhook 订阅**：topic 列表以仓库根目录 `shopify.app.toml` 的 `[webhooks]` 为准（含 **`products/delete`、`orders/delete`、`markets/delete`** 等删除感知 topic；随应用配置同步到 Shopify）。OAuth 回调 **不再** 调用 Admin REST 注册 webhooks，避免与 App 配置 **重复订阅**、同一事件多次投递。
 
+   **Lambda 预热**：Api 栈通过 EventBridge **每 5 分钟** 调用 **Webhook 入口**、**OAuth** 与 **Worker**（payload `source=gwofy.lambda-warmup`），降低冷启动导致 webhook 超时、Shopify 自动禁用订阅的风险。Handler 对 warmup 直接返回成功，不写 SQS / 不执行业务逻辑。
+
    **Shopify 侧**：同一应用可在 Partner Dashboard 配置 **多个 redirect URL**（dev/staging/prod 各一条）；Webhook 地址亦可按环境各配一条。也可为 dev/prod 分别创建 Custom app，隔离 `client_id`。
 
 5. 安装流程：将商家引导至你应用的 Shopify OAuth 授权地址；回调命中 `/oauth/callback`。Worker 的 **`INITIAL_SYNC`** 仅做 **店铺资料**（币种、市场等）与 **自动激活**（创建 Shipping Protection 商品）；完成后 **异步入队 `CATALOG_SYNC`**（商品/订单）与 **`THEME_SYNC`**（Online Store 主题及文件）。激活失败不阻塞入队；错误写入 `last_activation_error`，可稍后 **`POST /api/activate`** 重试。
@@ -247,7 +249,18 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 路径均位于 `{HttpApiUrl}` 根下，请求头 `Authorization: Bearer <session_token>`（与 [Session token](https://shopify.dev/docs/apps/auth/session-tokens) 一致）。
 
-**离线 token 自动补救**（所有上表 Session 路由，不含 `/api/cart-config`）：若 `installation_status=OFFLINE_AUTH_EXPIRED`、缺少 `refresh_token_enc`、或 refresh 将在 **7** 天内过期（`OFFLINE_REFRESH_RECOVERY_WINDOW_DAYS`），后端用当前 Session Token 做 [token exchange](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange) 换新 offline 对并恢复 **ACTIVE**（审计 `OFFLINE_TOKEN_SESSION_RECOVERY`）；关键失败 **401** `shopify_offline_auth_failed` / **502** `offline_token_recovery_failed`。
+### 店面静态脚本（公开，无需 JWT / HMAC）
+
+与 `POST /api/cart-config` **解耦**；响应中**不**下发脚本 URL。主题在 Liquid 中加载 **`app-config.js`**（按店铺注入 `GWOFY_CONFIG`），由配置层 bootstrap 后再加载 **`app-storefront.js`** 并执行 `GwofyStorefront.init()`。合并后的 `GWOFY_CONFIG.remoteScriptUrls` **默认**包含 `{WEBHOOK_BASE_URL}/static/app-storefront.js?v={APP_STOREFRONT_VERSION}`（生产一般为 `https://sp-prod.gwofy.com/static/app-storefront.js?v=1.0.0`）；bootstrap 会将其从「远程补丁」链中排除，仅在 `finalizeConfig` 后由 `loadStorefront` 加载一次。主题也可在 **`app-config.js` 之前** 用 Liquid 设置 `window.GWOFY_STOREFRONT_ASSET_URL` 覆盖该 URL。
+
+**店铺编号（查询参数）** = Shopify 店铺主机名，如 `gwo-dev.myshopify.com`（与 `pk_shop`、Admin `/admin/shops/{shop}`、`POST /api/cart-config` 的 `shopDomain` 规范化规则一致）。**不是** `/api/me` 的 `auth_id`（10 位 `store_number`）。脚本内 `GWOFY_CONFIG.shopId` 亦为该主机名。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET, HEAD | `/static/app-config.js` | **无 JWT / 无 HMAC**。Query **必填** `shop`（或别名 `shopId`）= `*.myshopify.com` 主机名。按店铺合并默认配置、`METADATA` 运营字段（费率/保额/提示/开关等）与 `storefront_config_json` 后返回 `lambda/static/app-config.kernel.js` + 注入的 `GWOFY_CONFIG`（`Content-Type: application/javascript`）。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。响应头 **`X-Gwofy-Asset-Version`**（`APP_CONFIG_VERSION`）、**`ETag`**（按店铺配置 hash，仅作校验/调试）；**不下发** `Cache-Control`，**不支持** `If-None-Match` → 304（每次返回完整脚本，便于运营改 `storefront_config_json` 后立即生效）。示例：`/static/app-config.js?shop=gwo-dev.myshopify.com`。**发版**：改 kernel / 默认 JSON → bump `APP_CONFIG_VERSION` → 部署 Api 栈。 |
+| GET, HEAD | `/static/app-storefront.js` | 返回 `lambda/static/app-storefront.js`（`Content-Type: application/javascript`）。响应头 **`X-Gwofy-Asset-Version`**（当前部署版本，见 `lambda/lib/static_assets.py` 中 `APP_STOREFRONT_VERSION`）、**`ETag`**（内容 hash）、`Cache-Control: public, max-age=3600, must-revalidate`；`If-None-Match` 匹配 → **304**。可选在主题 URL 加 **`?v=1.0.0`** 做 cache bust（与版本号一致）。**发版**：改 JS → bump `APP_STOREFRONT_VERSION` → 部署 Api 栈 → 同步主题 `?v=`。 |
+
+**离线 token 自动补救**（所有上表 Session 路由，不含 `/api/cart-config` 与上表静态脚本）：若 `installation_status=OFFLINE_AUTH_EXPIRED`、缺少 `refresh_token_enc`、或 refresh 将在 **7** 天内过期（`OFFLINE_REFRESH_RECOVERY_WINDOW_DAYS`），后端用当前 Session Token 做 [token exchange](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange) 换新 offline 对并恢复 **ACTIVE**（审计 `OFFLINE_TOKEN_SESSION_RECOVERY`）；关键失败 **401** `shopify_offline_auth_failed` / **502** `offline_token_recovery_failed`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -301,6 +314,8 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `GET /admin/config/calc-coverage-tips`、`PUT /admin/config/calc-coverage-tips`，body：`{"spBelowMinCoverageTip":"<字符串>","spGreaterMaxCoverageTip":"<字符串>"}` — **全局**购物车 **`calcInfo`** 保额提示文案（默认空串）
   - `GET /admin/shops/{shop}/calc-coverage-tips` → `global`、`shopOverride`（店铺是否覆盖）、`effective`（店铺请求 **`/api/cart-config`** 时实际下发）
   - `PUT /admin/shops/{shop}/calc-coverage-tips`，body 可只含其一或两项：`spBelowMinCoverageTip`、`spGreaterMaxCoverageTip`；值为 **`null`** 表示删除该字段覆盖并回退全局 — 与 **`POST /api/cart-config`** 里 **`calcInfo.spBelowMinCoverageTip` / `spGreaterMaxCoverageTip`** 同源（**已移除** `calcInfo` 中的 `spMaxCoverage`、`spMinCoverage`、`zeroBuyConf`，保额上限仍以 **`maxAmount`** 表示）
+  - `GET /admin/shops/{shop}/storefront-config` → `{ shop, defaults, derived, shopOverride, effective }` — 店面 `GWOFY_CONFIG` 预览；`effective` 为合并后的最终配置
+  - `PUT /admin/shops/{shop}/storefront-config`，body 为 **partial** 对象（写入 `storefront_config_json`）；`null` 删除覆盖项。**不可**通过本接口改 `shopId`、`productHandle`、`supportedCurrencies`、`auth.isOpenForSP`（分别由店铺域名 derived、激活商品的 handle、店铺已启用货币、`shipping_protection_status === OPEN_AUDITED` 管理；`OPEN_UNAUDITED` 时 `auth.isOpenForSP` 为 **false**）。**店面算价/保额**（`pricing.calcRate` 默认 **`0.04`**、`spMaxCoverage`、`hardMaxAmount`、`spMinCoverage`、保额提示文案等）**仅**在本接口 `pricing` 对象中配置，**不再**从 `shipping-calc-settings` / `calc-coverage-tips` 合并进 `app-config.js`（`POST /api/cart-config` 仍使用原运营字段，与店面脚本配置解耦）。
   - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、**`sp_max_coverage_by_currency`**（不再接受 `sp_country_max_overrides`）
   - `POST /admin/shops/{shop}/sync-enabled-currencies` — 用店铺离线 token 拉取 Shopify 启用货币列表（与商户 **`POST /api/shop-enabled-currencies/sync`** 同源逻辑）
   - `POST /admin/shops/{shop}/sync` — **手动拉取/更新** 店铺镜像数据。Body：`{"resources":["all"]}` 或 `["shop_profile","products","orders","currencies","markets","catalog"]`（`catalog` = 商品+订单）；**`async`** 默认 **`true`**（入队 Worker，**202**）；**`false`** 时在 Admin Lambda 内同步执行（**29s** 超时，仅适合 profile/currencies/markets）。**`reset_checkpoints`**：`true` 时商品/订单全量从第一页重拉。同步模式成功 **200** / 部分失败 **502**，返回 **`steps`** 各资源结果。

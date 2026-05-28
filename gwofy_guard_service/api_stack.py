@@ -30,6 +30,9 @@ from gwofy_guard_service.storage_stack import StorageStack
 
 LAMBDA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "lambda"))
 
+# Must match lambda/lib/lambda_warmup.py WARMUP_EVENT_SOURCE
+_LAMBDA_WARMUP_EVENT_SOURCE = "gwofy.lambda-warmup"
+
 # Graviton (ARM64) for all functions in this stack; Docker bundling uses linux/arm64 (native on Apple Silicon).
 _LAMBDA_ARCHITECTURE = aws_lambda.Architecture.ARM_64
 _LAMBDA_DOCKER_PLATFORM = "linux/arm64"
@@ -464,6 +467,16 @@ class ApiStack(Stack):
             integration=merchant_integ,
         )
         http_api.add_routes(
+            path="/static/app-storefront.js",
+            methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.HEAD],
+            integration=merchant_integ,
+        )
+        http_api.add_routes(
+            path="/static/app-config.js",
+            methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.HEAD],
+            integration=merchant_integ,
+        )
+        http_api.add_routes(
             path="/api/cart-config",
             methods=[apigwv2.HttpMethod.POST],
             integration=merchant_integ,
@@ -502,6 +515,19 @@ class ApiStack(Stack):
             "ReconcileSchedule",
             schedule=events.Schedule.rate(Duration.days(1)),
         ).add_target(targets.LambdaFunction(reconcile_fn))
+
+        warmup_payload = events.RuleTargetInput.from_object({"source": _LAMBDA_WARMUP_EVENT_SOURCE})
+        warmup_rule = events.Rule(
+            self,
+            "LambdaWarmupSchedule",
+            schedule=events.Schedule.rate(Duration.minutes(5)),
+            description=(
+                "Keep webhook ingress (and related) Lambdas warm — reduces cold-start "
+                "timeouts that cause Shopify to disable webhooks"
+            ),
+        )
+        for fn in (webhook_fn, oauth_fn, worker_fn):
+            warmup_rule.add_target(targets.LambdaFunction(fn, event=warmup_payload))
 
         if custom_domain_fqdn and custom_domain_certificate_arn:
             cert = acm.Certificate.from_certificate_arn(

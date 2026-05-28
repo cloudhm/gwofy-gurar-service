@@ -8,6 +8,7 @@ import os
 
 import boto3
 
+from lib.lambda_warmup import is_warmup_event
 from lib.logging_json import setup_logging
 from lib.shopify_api import verify_webhook_hmac
 
@@ -64,6 +65,9 @@ def _request_snapshot(event: dict, raw_body: bytes) -> dict:
 
 
 def handler(event, context):
+    if is_warmup_event(event):
+        return {"statusCode": 200, "body": json.dumps({"ok": True, "warmup": True})}
+
     client_secret = os.environ["SHOPIFY_CLIENT_SECRET"]
     queue_url = os.environ["WORK_QUEUE_URL"]
 
