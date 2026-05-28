@@ -35,6 +35,7 @@ from lib.static_assets import (
     get_app_config_js_for_shop,
     get_app_storefront_asset,
 )
+from lib.static_scripts import resolve_public_script
 from lib.storefront_gwofy_config import (
     build_effective_gwofy_config,
     is_valid_shop_host,
@@ -88,11 +89,11 @@ def handler(event, context):
     table_name = os.environ["TABLE_NAME"]
     table = ddb.Table(table_name)
 
-    if method in ("GET", "HEAD") and path == "/static/app-storefront.js":
-        return _serve_app_storefront_js(method, headers)
-
     if method in ("GET", "HEAD") and path == "/static/app-config.js":
         return _serve_app_config_js(event, method, headers, table)
+
+    if method in ("GET", "HEAD") and path.startswith("/static/") and path.endswith(".js"):
+        return _serve_public_static_js(method, path, headers, table)
 
     if method == "POST" and path == "/api/cart-config":
         return _cart_config(event, table, req_id)
@@ -871,14 +872,50 @@ def _etag_matches(if_none_match: str, etag: str) -> bool:
     return False
 
 
-def _serve_app_storefront_js(method: str, headers: dict[str, str]):
-    body_bytes, etag, version = get_app_storefront_asset()
+def _static_script_name_from_path(path: str) -> str | None:
+    if not path.startswith("/static/"):
+        return None
+    name = path[len("/static/") :].strip()
+    if not name or "/" in name or not name.endswith(".js"):
+        return None
+    return name
+
+
+def _serve_public_static_js(method: str, path: str, headers: dict[str, str], table):
+    name = _static_script_name_from_path(path)
+    if not name or name == "app-config.js":
+        return _resp(404, {"error": "script_not_found"})
+
+    uploaded = resolve_public_script(name, table)
+    if uploaded is not None:
+        body_bytes, etag = uploaded
+        return _js_resp_from_bytes(method, headers, body_bytes, etag=etag, version="")
+
+    if name == "app-storefront.js":
+        return _serve_app_storefront_js(method, headers)
+
+    return _resp(404, {"error": "script_not_found"})
+
+
+def _js_resp_from_bytes(
+    method: str,
+    headers: dict[str, str],
+    body_bytes: bytes,
+    *,
+    etag: str,
+    version: str,
+):
     inm = headers.get("if-none-match") or ""
     if _etag_matches(inm, etag):
         return _js_resp(304, etag=etag, version=version)
     if method == "HEAD":
         return _js_resp(200, etag=etag, version=version)
     return _js_resp(200, body=body_bytes.decode("utf-8"), etag=etag, version=version)
+
+
+def _serve_app_storefront_js(method: str, headers: dict[str, str]):
+    body_bytes, etag, version = get_app_storefront_asset()
+    return _js_resp_from_bytes(method, headers, body_bytes, etag=etag, version=version)
 
 
 def _serve_app_config_js(event, method: str, headers: dict[str, str], table):

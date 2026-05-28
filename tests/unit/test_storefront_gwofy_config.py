@@ -6,14 +6,16 @@ from unittest.mock import MagicMock, patch
 
 from lib.shop_enabled_currencies import shop_supported_currencies_list
 from lib.storefront_gwofy_config import (
+    DEFAULT_REMOTE_SCRIPT_URLS,
+    apply_default_remote_script_urls_if_needed,
     build_effective_gwofy_config,
     default_gwofy_config,
     derived_from_meta,
     derived_readonly_keys_in_patch,
     effective_protection_product_handle,
-    ensure_default_remote_script_urls,
     merge_storefront_config_patch,
     normalize_shop_host,
+    shop_override_has_remote_script_urls,
     validate_storefront_config_patch,
 )
 
@@ -165,25 +167,24 @@ def test_effective_pricing_from_defaults_and_override():
     assert eff["pricing"]["hardMaxAmount"] == "13000"
 
 
-def test_ensure_default_remote_script_urls(monkeypatch):
-    monkeypatch.setenv("WEBHOOK_BASE_URL", "https://sp-prod.gwofy.com")
-    cfg = ensure_default_remote_script_urls({"remoteScriptUrls": []})
-    assert cfg["remoteScriptUrls"] == [
-        "https://sp-prod.gwofy.com/static/app-storefront.js?v=1.0.0"
-    ]
-    again = ensure_default_remote_script_urls(cfg)
-    assert again["remoteScriptUrls"] == cfg["remoteScriptUrls"]
+def test_apply_default_remote_script_urls_when_not_overridden():
+    cfg = apply_default_remote_script_urls_if_needed({"remoteScriptUrls": []}, None)
+    assert cfg["remoteScriptUrls"] == DEFAULT_REMOTE_SCRIPT_URLS
 
 
-def test_build_effective_includes_default_storefront_url(monkeypatch):
-    monkeypatch.setenv("WEBHOOK_BASE_URL", "https://sp-prod.gwofy.com")
+def test_apply_default_skips_when_shop_override():
+    meta = {"storefront_config_json": '{"remoteScriptUrls":[]}'}
+    cfg = apply_default_remote_script_urls_if_needed({"remoteScriptUrls": ["x"]}, meta)
+    assert cfg["remoteScriptUrls"] == ["x"]
+    assert shop_override_has_remote_script_urls(meta) is True
+
+
+def test_build_effective_includes_default_storefront_url():
     meta = {"shipping_protection_status": "CLOSED", "shop_currency_code": "USD"}
     table = MagicMock()
     with _patch_derived_helpers():
         eff = build_effective_gwofy_config(table, meta, "gwo-dev.myshopify.com")
-    assert eff["remoteScriptUrls"][0] == (
-        "https://sp-prod.gwofy.com/static/app-storefront.js?v=1.0.0"
-    )
+    assert eff["remoteScriptUrls"] == DEFAULT_REMOTE_SCRIPT_URLS
 
 
 def test_build_effective_merges_layers():

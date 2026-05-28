@@ -251,14 +251,42 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 ### 店面静态脚本（公开，无需 JWT / HMAC）
 
-与 `POST /api/cart-config` **解耦**；响应中**不**下发脚本 URL。主题在 Liquid 中加载 **`app-config.js`**（按店铺注入 `GWOFY_CONFIG`），由配置层 bootstrap 后再加载 **`app-storefront.js`** 并执行 `GwofyStorefront.init()`。合并后的 `GWOFY_CONFIG.remoteScriptUrls` **默认**包含 `{WEBHOOK_BASE_URL}/static/app-storefront.js?v={APP_STOREFRONT_VERSION}`（生产一般为 `https://sp-prod.gwofy.com/static/app-storefront.js?v=1.0.0`）；bootstrap 会将其从「远程补丁」链中排除，仅在 `finalizeConfig` 后由 `loadStorefront` 加载一次。主题也可在 **`app-config.js` 之前** 用 Liquid 设置 `window.GWOFY_STOREFRONT_ASSET_URL` 覆盖该 URL。
+与 `POST /api/cart-config` **解耦**；响应中**不**下发脚本 URL。主题在 Liquid 中加载 **`app-config.js`**（按店铺注入 `GWOFY_CONFIG`），由配置层 bootstrap 后再加载 **`app-storefront.js`** 并执行 `GwofyStorefront.init()`。店铺**未**在 `storefront_config_json` 中配置 `remoteScriptUrls` 时，effective 默认为 **`["https://sp-prod.gwofy.com/static/app-storefront.js"]`**；bootstrap 会将其中匹配 `/static/app-storefront.js` 的 URL 从「远程补丁」链中排除，仅在 `finalizeConfig` 后由 `loadStorefront` 加载一次。主题也可在 **`app-config.js` 之前** 用 Liquid 设置 `window.GWOFY_STOREFRONT_ASSET_URL` 覆盖该 URL。
+
+**Admin 全局 JS 管理**（仅 Cognito 管理组，**不可**经商户 Session API 或公开静态路由写入）：`GET /admin/static-scripts` 列出已上传脚本；`GET /admin/static-scripts/{name}` 读取全文供编辑；`PUT /admin/static-scripts/{name}` 新建/保存（单文件上限约 **350KB**）；`DELETE /admin/static-scripts/{name}` 删除上传。店面 **`GET|HEAD /static/{name}.js`** 为**只读**：优先 DynamoDB 上传内容，无上传时 `app-storefront.js` 回退 Lambda 内置文件。
+
+**`PUT /admin/static-scripts/{name}` 上传方式**（任选其一；`{name}` 须为 `*.js`，如 `store1.js`）：
+
+| 方式 | Content-Type | Body |
+|------|----------------|------|
+| JSON 文本 | `application/json` | `{"source":"<完整 JS 字符串>","confirmOverwrite":false}` |
+| JSON Base64 | `application/json` | `{"sourceBase64":"<文件 Base64>","confirmOverwrite":false}` |
+| 原始 JS 文件 | `application/javascript` 或 `text/javascript` | **请求体即为整个 .js 文件内容**；覆盖确认用 query `?confirmOverwrite=true` 或头 `X-Confirm-Overwrite: true` |
+| 表单上传 | `multipart/form-data` | 字段名 **`file`**（或 `source`）为文件；覆盖确认同上 |
+
+示例（直接上传本地 `store1.js` 文件内容）：
+
+```bash
+curl -X PUT "https://sp-prod.gwofy.com/admin/static-scripts/store1.js" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -H "Content-Type: application/javascript" \
+  --data-binary @store1.js
+```
+
+```bash
+curl -X PUT "https://sp-prod.gwofy.com/admin/static-scripts/store1.js" \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -F "file=@store1.js"
+```
+
+同名已存在且未确认 → **409** `name_exists`；再次请求加 `confirmOverwrite: true`（JSON）、`?confirmOverwrite=true`（原始/表单）即可覆盖。
 
 **店铺编号（查询参数）** = Shopify 店铺主机名，如 `gwo-dev.myshopify.com`（与 `pk_shop`、Admin `/admin/shops/{shop}`、`POST /api/cart-config` 的 `shopDomain` 规范化规则一致）。**不是** `/api/me` 的 `auth_id`（10 位 `store_number`）。脚本内 `GWOFY_CONFIG.shopId` 亦为该主机名。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET, HEAD | `/static/app-config.js` | **无 JWT / 无 HMAC**。Query **必填** `shop`（或别名 `shopId`）= `*.myshopify.com` 主机名。按店铺合并默认配置、`METADATA` 运营字段（费率/保额/提示/开关等）与 `storefront_config_json` 后返回 `lambda/static/app-config.kernel.js` + 注入的 `GWOFY_CONFIG`（`Content-Type: application/javascript`）。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。响应头 **`X-Gwofy-Asset-Version`**（`APP_CONFIG_VERSION`）、**`ETag`**（按店铺配置 hash，仅作校验/调试）；**不下发** `Cache-Control`，**不支持** `If-None-Match` → 304（每次返回完整脚本，便于运营改 `storefront_config_json` 后立即生效）。示例：`/static/app-config.js?shop=gwo-dev.myshopify.com`。**发版**：改 kernel / 默认 JSON → bump `APP_CONFIG_VERSION` → 部署 Api 栈。 |
-| GET, HEAD | `/static/app-storefront.js` | 返回 `lambda/static/app-storefront.js`（`Content-Type: application/javascript`）。响应头 **`X-Gwofy-Asset-Version`**（当前部署版本，见 `lambda/lib/static_assets.py` 中 `APP_STOREFRONT_VERSION`）、**`ETag`**（内容 hash）、`Cache-Control: public, max-age=3600, must-revalidate`；`If-None-Match` 匹配 → **304**。可选在主题 URL 加 **`?v=1.0.0`** 做 cache bust（与版本号一致）。**发版**：改 JS → bump `APP_STOREFRONT_VERSION` → 部署 Api 栈 → 同步主题 `?v=`。 |
+| GET, HEAD | `/static/{name}.js` | 公开只读。`name` 为单段 `*.js` 文件名（如 `app-storefront.js`、`patch-v2.js`）。**优先** Admin 上传至 DynamoDB 的内容；`app-storefront.js` 无上传时回退 `lambda/static/app-storefront.js`（内置版本见 `APP_STOREFRONT_VERSION`）。**`ETag`**、**`Cache-Control: public, max-age=3600, must-revalidate`**；`If-None-Match` → **304**。`app-config.js` 仍走上一行专用路由。 |
 
 **离线 token 自动补救**（所有上表 Session 路由，不含 `/api/cart-config` 与上表静态脚本）：若 `installation_status=OFFLINE_AUTH_EXPIRED`、缺少 `refresh_token_enc`、或 refresh 将在 **7** 天内过期（`OFFLINE_REFRESH_RECOVERY_WINDOW_DAYS`），后端用当前 Session Token 做 [token exchange](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange) 换新 offline 对并恢复 **ACTIVE**（审计 `OFFLINE_TOKEN_SESSION_RECOVERY`）；关键失败 **401** `shopify_offline_auth_failed` / **502** `offline_token_recovery_failed`。
 
@@ -315,7 +343,8 @@ python3 scripts/check_gwofy_deploy.py --stage dev
   - `GET /admin/shops/{shop}/calc-coverage-tips` → `global`、`shopOverride`（店铺是否覆盖）、`effective`（店铺请求 **`/api/cart-config`** 时实际下发）
   - `PUT /admin/shops/{shop}/calc-coverage-tips`，body 可只含其一或两项：`spBelowMinCoverageTip`、`spGreaterMaxCoverageTip`；值为 **`null`** 表示删除该字段覆盖并回退全局 — 与 **`POST /api/cart-config`** 里 **`calcInfo.spBelowMinCoverageTip` / `spGreaterMaxCoverageTip`** 同源（**已移除** `calcInfo` 中的 `spMaxCoverage`、`spMinCoverage`、`zeroBuyConf`，保额上限仍以 **`maxAmount`** 表示）
   - `GET /admin/shops/{shop}/storefront-config` → `{ shop, defaults, derived, shopOverride, effective }` — 店面 `GWOFY_CONFIG` 预览；`effective` 为合并后的最终配置
-  - `PUT /admin/shops/{shop}/storefront-config`，body 为 **partial** 对象（写入 `storefront_config_json`）；`null` 删除覆盖项。**不可**通过本接口改 `shopId`、`productHandle`、`supportedCurrencies`、`auth.isOpenForSP`（分别由店铺域名 derived、激活商品的 handle、店铺已启用货币、`shipping_protection_status === OPEN_AUDITED` 管理；`OPEN_UNAUDITED` 时 `auth.isOpenForSP` 为 **false**）。**店面算价/保额**（`pricing.calcRate` 默认 **`0.04`**、`spMaxCoverage`、`hardMaxAmount`、`spMinCoverage`、保额提示文案等）**仅**在本接口 `pricing` 对象中配置，**不再**从 `shipping-calc-settings` / `calc-coverage-tips` 合并进 `app-config.js`（`POST /api/cart-config` 仍使用原运营字段，与店面脚本配置解耦）。
+  - `PUT /admin/shops/{shop}/storefront-config`，body 为 **partial** 对象（写入 `storefront_config_json`）；`null` 删除覆盖项。**不可**通过本接口改 `shopId`、`productHandle`、`supportedCurrencies`、`auth.isOpenForSP`（分别由店铺域名 derived、激活商品的 handle、店铺已启用货币、`shipping_protection_status === OPEN_AUDITED` 管理；`OPEN_UNAUDITED` 时 `auth.isOpenForSP` 为 **false**）。**店面算价/保额**（`pricing.calcRate` 默认 **`0.04`**、`spMaxCoverage`、`hardMaxAmount`、`spMinCoverage`、保额提示文案等）**仅**在本接口 `pricing` 对象中配置，**不再**从 `shipping-calc-settings` / `calc-coverage-tips` 合并进 `app-config.js`（`POST /api/cart-config` 仍使用原运营字段，与店面脚本配置解耦）。**`remoteScriptUrls`**（字符串 URL 数组）可在此按店铺配置；未配置时 `app-config.js` 注入默认 **`["https://sp-prod.gwofy.com/static/app-storefront.js"]`**；可引用 Admin 上传脚本的 `{WEBHOOK_BASE_URL}/static/{name}.js`。
+  - `GET /admin/static-scripts` → `{ "scripts": [...] }`；`GET /admin/static-scripts/{name}` → 含 `source` 全文；`PUT /admin/static-scripts/{name}` → 新建 **201** / 更新 **200**（`confirmOverwrite`）；`DELETE /admin/static-scripts/{name}` — 见上文「Admin 全局 JS 管理」。
   - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、**`sp_max_coverage_by_currency`**（不再接受 `sp_country_max_overrides`）
   - `POST /admin/shops/{shop}/sync-enabled-currencies` — 用店铺离线 token 拉取 Shopify 启用货币列表（与商户 **`POST /api/shop-enabled-currencies/sync`** 同源逻辑）
   - `POST /admin/shops/{shop}/sync` — **手动拉取/更新** 店铺镜像数据。Body：`{"resources":["all"]}` 或 `["shop_profile","products","orders","currencies","markets","catalog"]`（`catalog` = 商品+订单）；**`async`** 默认 **`true`**（入队 Worker，**202**）；**`false`** 时在 Admin Lambda 内同步执行（**29s** 超时，仅适合 profile/currencies/markets）。**`reset_checkpoints`**：`true` 时商品/订单全量从第一页重拉。同步模式成功 **200** / 部分失败 **502**，返回 **`steps`** 各资源结果。

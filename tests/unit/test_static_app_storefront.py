@@ -1,7 +1,7 @@
 """GET/HEAD /static/app-storefront.js — public storefront script."""
 
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -31,7 +31,11 @@ def test_get_app_storefront_js():
     from lib.static_assets import APP_STOREFRONT_VERSION, get_app_storefront_asset
     from merchant_api_handler import handler
 
-    out = handler(_static_event("GET"), None)
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}
+
+    with patch("merchant_api_handler.ddb.Table", return_value=tbl):
+        out = handler(_static_event("GET"), None)
     assert out["statusCode"] == 200
     assert "javascript" in out["headers"]["Content-Type"]
     assert out["headers"]["X-Gwofy-Asset-Version"] == APP_STOREFRONT_VERSION
@@ -43,7 +47,11 @@ def test_get_app_storefront_js():
 def test_head_app_storefront_js():
     from merchant_api_handler import handler
 
-    out = handler(_static_event("HEAD"), None)
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}
+
+    with patch("merchant_api_handler.ddb.Table", return_value=tbl):
+        out = handler(_static_event("HEAD"), None)
     assert out["statusCode"] == 200
     assert out["body"] == ""
     assert "ETag" in out["headers"]
@@ -54,7 +62,11 @@ def test_if_none_match_returns_304():
     from merchant_api_handler import handler
 
     _, etag, _ = get_app_storefront_asset()
-    out = handler(_static_event("GET", if_none_match=f'"{etag}"'), None)
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}
+
+    with patch("merchant_api_handler.ddb.Table", return_value=tbl):
+        out = handler(_static_event("GET", if_none_match=f'"{etag}"'), None)
     assert out["statusCode"] == 304
     assert out["body"] == ""
 
@@ -62,7 +74,11 @@ def test_if_none_match_returns_304():
 def test_static_route_does_not_require_bearer():
     from merchant_api_handler import handler
 
-    out = handler(_static_event("GET"), None)
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}
+
+    with patch("merchant_api_handler.ddb.Table", return_value=tbl):
+        out = handler(_static_event("GET"), None)
     assert out["statusCode"] == 200
 
 

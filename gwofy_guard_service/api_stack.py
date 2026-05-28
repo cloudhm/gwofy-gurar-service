@@ -467,12 +467,12 @@ class ApiStack(Stack):
             integration=merchant_integ,
         )
         http_api.add_routes(
-            path="/static/app-storefront.js",
+            path="/static/app-config.js",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.HEAD],
             integration=merchant_integ,
         )
         http_api.add_routes(
-            path="/static/app-config.js",
+            path="/static/{proxy+}",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.HEAD],
             integration=merchant_integ,
         )

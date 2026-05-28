@@ -60,10 +60,10 @@ def test_get_app_config_js():
     assert "GWOFY_CONFIG" in out["body"]
     assert "gwo-dev.myshopify.com" in out["body"]
     assert out["headers"]["X-Gwofy-Asset-Version"] == "1.0.0"
-    assert "api.example.com/static/app-storefront.js" in out["body"]
-    assert '"remoteScriptUrls":["https://api.example.com/static/app-storefront.js?v=1.0.0"]' in out[
-        "body"
-    ].replace(" ", "")
+    assert (
+        '"remoteScriptUrls":["https://sp-prod.gwofy.com/static/app-storefront.js"]'
+        in out["body"].replace(" ", "")
+    )
     assert not out["body"].startswith("g.GWOFY_STOREFRONT_ASSET_URL")
 
 

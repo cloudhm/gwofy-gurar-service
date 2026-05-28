@@ -66,6 +66,7 @@ _MAX_REMOTE_SCRIPTS = 8
 _DEFAULT_CALC_RATE = "0.04"
 # Keep in sync with static_assets.APP_STOREFRONT_VERSION when not passing version explicitly.
 _DEFAULT_STOREFRONT_JS_VERSION = "1.0.0"
+DEFAULT_REMOTE_SCRIPT_URLS = ["https://sp-prod.gwofy.com/static/app-storefront.js"]
 
 
 def normalize_shop_host(raw: str | None) -> str | None:
@@ -215,26 +216,33 @@ def default_storefront_asset_url(*, storefront_js_version: str = _DEFAULT_STOREF
     return f"{base}/static/app-storefront.js?v={storefront_js_version}"
 
 
-def ensure_default_remote_script_urls(
-    config: dict[str, Any],
-    *,
-    storefront_js_version: str = _DEFAULT_STOREFRONT_JS_VERSION,
-) -> dict[str, Any]:
-    """Ensure effective config lists the versioned app-storefront.js URL by default."""
-    url = default_storefront_asset_url(storefront_js_version=storefront_js_version)
-    if not url:
-        return config
-    out = copy.deepcopy(config)
-    raw = out.get("remoteScriptUrls")
-    if raw is None:
-        urls: list[str] = []
-    elif isinstance(raw, str):
-        urls = [raw.strip()] if raw.strip() else []
+def shop_override_has_remote_script_urls(meta: dict[str, Any] | None) -> bool:
+    """True when storefront_config_json explicitly sets remoteScriptUrls."""
+    if not meta:
+        return False
+    raw = meta.get(STOREFRONT_CONFIG_JSON)
+    if not raw:
+        return False
+    if isinstance(raw, dict):
+        data = raw
     else:
-        urls = [u.strip() for u in raw if isinstance(u, str) and u.strip()]
-    if not any(is_storefront_asset_url(u) for u in urls):
-        urls.insert(0, url)
-    out["remoteScriptUrls"] = urls
+        try:
+            data = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return False
+    if not isinstance(data, dict):
+        return False
+    return "remoteScriptUrls" in data
+
+
+def apply_default_remote_script_urls_if_needed(
+    merged: dict[str, Any],
+    meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if shop_override_has_remote_script_urls(meta):
+        return merged
+    out = copy.deepcopy(merged)
+    out["remoteScriptUrls"] = list(DEFAULT_REMOTE_SCRIPT_URLS)
     return out
 
 
@@ -245,12 +253,13 @@ def build_effective_gwofy_config(
     *,
     storefront_js_version: str = _DEFAULT_STOREFRONT_JS_VERSION,
 ) -> dict[str, Any]:
+    _ = storefront_js_version
     base = default_gwofy_config()
     derived = derived_from_meta(table, meta, shop_host)
     override = parse_storefront_config_from_meta(meta)
     merged = _deep_merge(base, derived)
     merged = _deep_merge(merged, override)
-    return ensure_default_remote_script_urls(merged, storefront_js_version=storefront_js_version)
+    return apply_default_remote_script_urls_if_needed(merged, meta)
 
 
 def _flatten_paths(obj: dict[str, Any], prefix: str = "") -> set[str]:
@@ -465,10 +474,7 @@ def config_layers_for_admin(
     *,
     storefront_js_version: str = _DEFAULT_STOREFRONT_JS_VERSION,
 ) -> dict[str, Any]:
-    defaults = ensure_default_remote_script_urls(
-        default_gwofy_config(),
-        storefront_js_version=storefront_js_version,
-    )
+    defaults = apply_default_remote_script_urls_if_needed(default_gwofy_config(), None)
     derived = derived_from_meta(table, meta, shop_host)
     shop_override = parse_storefront_config_from_meta(meta)
     effective = build_effective_gwofy_config(

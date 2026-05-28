@@ -11,6 +11,9 @@ SK_ACTIVITY_INFO = "ACTIVITY_INFO"
 SK_TIPS_INFO = "TIPS_INFO"
 SK_CALC_COVERAGE_TIPS = "CALC_COVERAGE_TIPS"
 
+# Admin-uploaded global storefront JS (served at /static/{name}.js).
+PK_GLOBAL_STATIC_JS = "GLOBAL#STATIC_JS"
+
 # Shop METADATA overrides for cart calc tips (inherit global when absent).
 META_SP_BELOW_MIN_COVERAGE_TIP = "sp_below_min_coverage_tip"
 META_SP_GREATER_MAX_COVERAGE_TIP = "sp_greater_max_coverage_tip"

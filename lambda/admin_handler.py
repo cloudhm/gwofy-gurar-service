@@ -34,6 +34,13 @@ from lib.models import (
     pk_tenant,
 )
 from lib.static_assets import APP_STOREFRONT_VERSION
+from lib.static_scripts import (
+    delete_script,
+    get_script,
+    list_scripts,
+    parse_static_script_put_payload,
+    put_script,
+)
 from lib.storefront_gwofy_config import (
     config_layers_for_admin,
     merge_storefront_config_patch,
@@ -174,6 +181,12 @@ def handler(event, context):
 
     if method == "POST" and path == "/admin/tools/decrypt-shopify-token":
         return _post_admin_decrypt_shopify_token(event, table, actor_sub, actor_email, req_id)
+
+    static_parts = path.strip("/").split("/")
+    if len(static_parts) >= 2 and static_parts[0] == "admin" and static_parts[1] == "static-scripts":
+        return _handle_admin_static_scripts(
+            method, static_parts, event, table, actor_sub, actor_email, req_id
+        )
 
     if method == "GET" and path == "/admin/shops":
         return _list_shops(event, table, actor_sub, req_id)
@@ -1256,6 +1269,97 @@ def _suspend(table, shop: str, suspend: bool, actor_sub: str, actor_email: str, 
         request_id=req_id,
     )
     return _resp(200, {"ok": True})
+
+
+def _handle_admin_static_scripts(
+    method: str,
+    parts: list[str],
+    event,
+    table,
+    actor_sub: str,
+    actor_email: str,
+    req_id: str,
+):
+    if method == "GET" and len(parts) == 2:
+        return _resp(200, {"scripts": list_scripts(table)})
+
+    if len(parts) != 3:
+        return _resp(404, {"error": "not_found"})
+
+    name = unquote(parts[2]).strip()
+    http_path = f"/admin/static-scripts/{name}"
+
+    if method == "GET":
+        detail = get_script(table, name)
+        if not detail:
+            return _resp(404, {"error": "not_found", "name": name})
+        return _resp(200, detail)
+
+    if method == "DELETE":
+        deleted = delete_script(table, name)
+        if not deleted:
+            return _resp(404, {"error": "not_found", "name": name})
+        append_audit(
+            table,
+            "_gwofy_system_",
+            actor_type="admin",
+            actor_id=actor_sub,
+            action="ADMIN_STATIC_SCRIPT_DELETE",
+            outcome="ok",
+            resource="static_script",
+            actor_email=actor_email or None,
+            detail={"name": name},
+            http_path=http_path,
+            request_id=req_id,
+        )
+        return _resp(200, {"ok": True, "name": name})
+
+    if method == "PUT":
+        try:
+            source, confirm = parse_static_script_put_payload(event)
+        except ValueError as e:
+            code = str(e)
+            if code in ("invalid_json", "body_must_be_object", "source_or_sourceBase64_required"):
+                return _resp(400, {"error": code})
+            if code == "invalid_sourceBase64":
+                return _resp(400, {"error": code})
+            return _resp(400, {"error": "invalid_static_script", "detail": code})
+        try:
+            created, detail = put_script(
+                table,
+                name,
+                source,
+                updated_by=actor_sub,
+                confirm_overwrite=confirm,
+            )
+        except FileExistsError:
+            return _resp(
+                409,
+                {
+                    "error": "name_exists",
+                    "name": name,
+                    "hint": "Retry with confirmOverwrite: true to replace the existing script.",
+                },
+            )
+        except ValueError as e:
+            return _resp(400, {"error": "invalid_static_script", "detail": str(e)})
+        action = "ADMIN_STATIC_SCRIPT_CREATE" if created else "ADMIN_STATIC_SCRIPT_UPDATE"
+        append_audit(
+            table,
+            "_gwofy_system_",
+            actor_type="admin",
+            actor_id=actor_sub,
+            action=action,
+            outcome="ok",
+            resource="static_script",
+            actor_email=actor_email or None,
+            detail={"name": detail["name"], "byteLength": detail.get("byteLength")},
+            http_path=http_path,
+            request_id=req_id,
+        )
+        return _resp(201 if created else 200, {"ok": True, **detail})
+
+    return _resp(404, {"error": "not_found"})
 
 
 def _resp(code: int, body: dict):
