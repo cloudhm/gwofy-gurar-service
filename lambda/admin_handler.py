@@ -40,6 +40,8 @@ from lib.static_scripts import (
     list_scripts,
     parse_static_script_put_payload,
     put_script,
+    script_name_rules,
+    validate_script_name,
 )
 from lib.storefront_gwofy_config import (
     config_layers_for_admin,
@@ -1281,13 +1283,25 @@ def _handle_admin_static_scripts(
     req_id: str,
 ):
     if method == "GET" and len(parts) == 2:
-        return _resp(200, {"scripts": list_scripts(table)})
+        return _resp(200, {"scripts": list_scripts(table), "nameRules": script_name_rules()})
 
     if len(parts) != 3:
         return _resp(404, {"error": "not_found"})
 
     name = unquote(parts[2]).strip()
     http_path = f"/admin/static-scripts/{name}"
+
+    try:
+        validate_script_name(name)
+    except ValueError as e:
+        return _resp(
+            400,
+            {
+                "error": "invalid_script_name",
+                "detail": str(e),
+                "nameRules": script_name_rules(),
+            },
+        )
 
     if method == "GET":
         detail = get_script(table, name)
@@ -1342,7 +1356,17 @@ def _handle_admin_static_scripts(
                 },
             )
         except ValueError as e:
-            return _resp(400, {"error": "invalid_static_script", "detail": str(e)})
+            code = str(e)
+            if code.startswith("script_name_"):
+                return _resp(
+                    400,
+                    {
+                        "error": "invalid_script_name",
+                        "detail": code,
+                        "nameRules": script_name_rules(),
+                    },
+                )
+            return _resp(400, {"error": "invalid_static_script", "detail": code})
         action = "ADMIN_STATIC_SCRIPT_CREATE" if created else "ADMIN_STATIC_SCRIPT_UPDATE"
         append_audit(
             table,

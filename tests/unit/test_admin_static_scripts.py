@@ -43,7 +43,9 @@ def test_list_static_scripts_empty():
         out = handler(_admin_event("GET", "/admin/static-scripts"), None)
 
     assert out["statusCode"] == 200
-    assert json.loads(out["body"]) == {"scripts": []}
+    body = json.loads(out["body"])
+    assert body["scripts"] == []
+    assert "app-config.js" in body["nameRules"]["reservedNames"]
 
 
 def test_put_create_and_get_script():
@@ -143,6 +145,32 @@ def test_delete_static_script():
         )
         out = handler(_admin_event("DELETE", "/admin/static-scripts/temp.js"), None)
     assert out["statusCode"] == 200
+
+
+def test_put_reserved_app_config_js_rejected():
+    from admin_handler import handler
+
+    tbl = MagicMock()
+    with (
+        patch("admin_handler.admin_in_required_group", return_value=(True, "GWOFY-SHIPPING-PROTECTION")),
+        patch("admin_handler.ddb.Table", return_value=tbl),
+    ):
+        out = handler(
+            {
+                "requestContext": {
+                    "http": {"method": "PUT", "path": "/admin/static-scripts/app-config.js"},
+                    "requestId": "r1",
+                    "authorizer": {"jwt": {"claims": {"sub": "admin1"}}},
+                },
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps({"source": "// x", "confirmOverwrite": False}),
+            },
+            None,
+        )
+    assert out["statusCode"] == 400
+    body = json.loads(out["body"])
+    assert body["error"] == "invalid_script_name"
+    assert body["detail"] == "script_name_reserved"
 
 
 def test_non_admin_forbidden():

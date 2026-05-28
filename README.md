@@ -255,7 +255,20 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 **Admin 全局 JS 管理**（仅 Cognito 管理组，**不可**经商户 Session API 或公开静态路由写入）：`GET /admin/static-scripts` 列出已上传脚本；`GET /admin/static-scripts/{name}` 读取全文供编辑；`PUT /admin/static-scripts/{name}` 新建/保存（单文件上限约 **350KB**）；`DELETE /admin/static-scripts/{name}` 删除上传。店面 **`GET|HEAD /static/{name}.js`** 为**只读**：优先 DynamoDB 上传内容，无上传时 `app-storefront.js` 回退 Lambda 内置文件。
 
-**`PUT /admin/static-scripts/{name}` 上传方式**（任选其一；`{name}` 须为 `*.js`，如 `store1.js`）：
+**脚本文件名 `{name}` 规则**（`PUT/GET/DELETE /admin/static-scripts/{name}`；`GET /admin/static-scripts` 响应含 **`nameRules`** 对象）：
+
+| 规则 | 说明 |
+|------|------|
+| 格式 | 正则 `^[a-zA-Z0-9][a-zA-Z0-9._-]*\.js$`：以 **ASCII 字母或数字** 开头，仅含 **字母、数字、`.`、`_`、`-`**，且必须以 **`.js`** 结尾 |
+| 禁止 | **空格**、**中文及其他非 ASCII**、路径符 **`/` `\` `..`** |
+| 保留名 | **`app-config.js`** 不可上传（该脚本由 `/static/app-config.js?shop=` 按店铺动态生成，不走上传表） |
+| 长度 | 最多 **128** 字符 |
+| 合法示例 | `store1.js`、`patch-v2.js`、`app.storefront.js` |
+| 非法示例 | `app-config.js`、`store 1.js`、`店铺.js` |
+
+违反规则 → **400** `invalid_script_name` + `detail`（如 `script_name_reserved`、`script_name_whitespace`、`script_name_non_ascii`）。
+
+**`PUT /admin/static-scripts/{name}` 上传方式**（任选其一；`{name}` 须符合上表）：
 
 | 方式 | Content-Type | Body |
 |------|----------------|------|

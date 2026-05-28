@@ -26,22 +26,61 @@ _RAW_JS_CONTENT_TYPES = frozenset(
 
 _MAX_SOURCE_BYTES = 350_000
 _MAX_NAME_LEN = 128
+# Reserved: served by dedicated routes / per-shop generation, not admin upload table.
 _BLOCKED_NAMES = frozenset({"app-config.js"})
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*\.js$")
 
 
+def script_name_rules() -> dict[str, Any]:
+    """Machine-readable naming rules for Admin UI / API clients."""
+    return {
+        "pattern": r"^[a-zA-Z0-9][a-zA-Z0-9._-]*\.js$",
+        "maxLength": _MAX_NAME_LEN,
+        "mustEndWith": ".js",
+        "firstChar": "ASCII letter or digit (a-z, A-Z, 0-9)",
+        "allowedChars": "ASCII letters, digits, dot (.), underscore (_), hyphen (-) only",
+        "disallowed": [
+            "spaces and whitespace",
+            "Chinese and other non-ASCII characters",
+            "slashes and path segments (/, \\, ..)",
+            "reserved name app-config.js",
+        ],
+        "reservedNames": sorted(_BLOCKED_NAMES),
+        "examplesValid": ["store1.js", "patch-v2.js", "app.storefront.js"],
+        "examplesInvalid": ["app-config.js", "store 1.js", "店铺.js", "x/.js"],
+    }
+
+
 def validate_script_name(name: str) -> str:
+    """
+    Validate upload filename (URL path segment after /admin/static-scripts/).
+
+    Raises ValueError with stable codes:
+    - script_name_required
+    - script_name_too_long
+    - script_name_path_chars
+    - script_name_reserved
+    - script_name_whitespace
+    - script_name_non_ascii
+    - script_name_invalid_format
+    """
     if not name or not isinstance(name, str):
-        raise ValueError("name is required")
+        raise ValueError("script_name_required")
     n = name.strip()
-    if not n or len(n) > _MAX_NAME_LEN:
-        raise ValueError("invalid script name")
+    if not n:
+        raise ValueError("script_name_required")
+    if len(n) > _MAX_NAME_LEN:
+        raise ValueError("script_name_too_long")
     if ".." in n or "/" in n or "\\" in n:
-        raise ValueError("invalid script name")
+        raise ValueError("script_name_path_chars")
     if n.lower() in _BLOCKED_NAMES:
-        raise ValueError("reserved script name")
+        raise ValueError("script_name_reserved")
+    if any(ch.isspace() for ch in n):
+        raise ValueError("script_name_whitespace")
+    if not n.isascii():
+        raise ValueError("script_name_non_ascii")
     if not _NAME_RE.match(n):
-        raise ValueError("invalid script name")
+        raise ValueError("script_name_invalid_format")
     return n
 
 
