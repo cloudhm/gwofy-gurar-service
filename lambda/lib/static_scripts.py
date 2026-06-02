@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-from .models import PK_GLOBAL_STATIC_JS
+from .models import APP_CONFIG_SCRIPT_NAME, GSI2_PK_SHOP_INDEX, PK_GLOBAL_STATIC_JS, SK_METADATA
+from .gwofy_config_js_transform import validate_gwofy_config_assignment
+from .storefront_gwofy_config import DEFAULT_APP_CONFIG_SCRIPT_NAME
 
 _RAW_JS_CONTENT_TYPES = frozenset(
     {
@@ -26,9 +28,13 @@ _RAW_JS_CONTENT_TYPES = frozenset(
 
 _MAX_SOURCE_BYTES = 350_000
 _MAX_NAME_LEN = 128
-# Reserved: served by dedicated routes / per-shop generation, not admin upload table.
-_BLOCKED_NAMES = frozenset({"app-config.js"})
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*\.js$")
+
+
+class AppConfigScriptInUseError(Exception):
+    def __init__(self, bound_shops: list[str]):
+        self.bound_shops = bound_shops
+        super().__init__(f"app_config_script_in_use:{','.join(bound_shops)}")
 
 
 def script_name_rules() -> dict[str, Any]:
@@ -43,11 +49,9 @@ def script_name_rules() -> dict[str, Any]:
             "spaces and whitespace",
             "Chinese and other non-ASCII characters",
             "slashes and path segments (/, \\, ..)",
-            "reserved name app-config.js",
         ],
-        "reservedNames": sorted(_BLOCKED_NAMES),
-        "examplesValid": ["store1.js", "patch-v2.js", "app.storefront.js"],
-        "examplesInvalid": ["app-config.js", "store 1.js", "店铺.js", "x/.js"],
+        "examplesValid": ["store1.js", "patch-v2.js", "app-config.js", "app.storefront.js"],
+        "examplesInvalid": ["store 1.js", "店铺.js", "x/.js"],
     }
 
 
@@ -59,7 +63,6 @@ def validate_script_name(name: str) -> str:
     - script_name_required
     - script_name_too_long
     - script_name_path_chars
-    - script_name_reserved
     - script_name_whitespace
     - script_name_non_ascii
     - script_name_invalid_format
@@ -73,8 +76,6 @@ def validate_script_name(name: str) -> str:
         raise ValueError("script_name_too_long")
     if ".." in n or "/" in n or "\\" in n:
         raise ValueError("script_name_path_chars")
-    if n.lower() in _BLOCKED_NAMES:
-        raise ValueError("script_name_reserved")
     if any(ch.isspace() for ch in n):
         raise ValueError("script_name_whitespace")
     if not n.isascii():
@@ -82,6 +83,18 @@ def validate_script_name(name: str) -> str:
     if not _NAME_RE.match(n):
         raise ValueError("script_name_invalid_format")
     return n
+
+
+def validate_app_config_source(source: str) -> None:
+    """Require g.GWOFY_CONFIG = ... assignment when isAppConfig is true on upload."""
+    validate_gwofy_config_assignment(source)
+
+
+def effective_app_config_script_name(meta: dict[str, Any] | None) -> str:
+    if not meta:
+        return DEFAULT_APP_CONFIG_SCRIPT_NAME
+    stored = str(meta.get(APP_CONFIG_SCRIPT_NAME) or "").strip()
+    return stored if stored else DEFAULT_APP_CONFIG_SCRIPT_NAME
 
 
 def validate_source(source: Any) -> str:
@@ -110,17 +123,55 @@ def _raw_body_bytes(event: dict[str, Any]) -> bytes:
     return text.encode("utf-8")
 
 
+def _truthy_query_param(raw: Any) -> bool | None:
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes"):
+        return True
+    if s in ("0", "false", "no"):
+        return False
+    return None
+
+
 def _confirm_overwrite_from_event(event: dict[str, Any], body_flag: bool = False) -> bool:
     if body_flag:
         return True
     qs = event.get("queryStringParameters") or {}
     if isinstance(qs, dict):
-        v = str(qs.get("confirmOverwrite") or "").strip().lower()
-        if v in ("1", "true", "yes"):
+        v = _truthy_query_param(qs.get("confirmOverwrite"))
+        if v is True:
             return True
     headers = _event_headers(event)
     hv = str(headers.get("x-confirm-overwrite") or "").strip().lower()
     return hv in ("1", "true", "yes")
+
+
+def _is_app_config_from_event(event: dict[str, Any], *, body_flag: bool | None = None) -> bool:
+    """
+    Resolve isAppConfig for PUT uploads.
+
+    JSON body explicit isAppConfig wins when body_flag is not None.
+    Otherwise query ?isAppConfig= or header X-Is-App-Config.
+    """
+    if body_flag is not None:
+        return bool(body_flag)
+    qs = event.get("queryStringParameters") or {}
+    if isinstance(qs, dict):
+        v = _truthy_query_param(qs.get("isAppConfig"))
+        if v is not None:
+            return v
+    headers = _event_headers(event)
+    hv = str(headers.get("x-is-app-config") or "").strip().lower()
+    if hv in ("1", "true", "yes"):
+        return True
+    if hv in ("0", "false", "no"):
+        return False
+    return False
 
 
 def _parse_multipart_source(body_bytes: bytes, content_type: str) -> str:
@@ -150,16 +201,18 @@ def _parse_multipart_source(body_bytes: bytes, content_type: str) -> str:
     raise ValueError("multipart body must include file or source field")
 
 
-def parse_static_script_put_payload(event: dict[str, Any]) -> tuple[str, bool]:
+def parse_static_script_put_payload(event: dict[str, Any]) -> tuple[str, bool, bool]:
     """
-  Parse PUT body for static script upload.
+    Parse PUT body for static script upload.
 
-  Supports:
-  - application/json: { "source": "...", "confirmOverwrite": bool }
-  - application/json: { "sourceBase64": "...", "confirmOverwrite": bool }
-  - Raw JS Content-Type: body is the full script (confirm via query/header)
-  - multipart/form-data: field `file` or `source` (confirm via query/header)
-  """
+    Returns (source, confirm_overwrite, is_app_config).
+
+    Supports:
+    - application/json: { "source": "...", "confirmOverwrite": bool, "isAppConfig": bool }
+    - application/json: { "sourceBase64": "...", ... }
+    - Raw JS Content-Type: body is the full script; confirmOverwrite / isAppConfig via query or header
+    - multipart/form-data: field `file` or `source`; confirmOverwrite / isAppConfig via query or header
+    """
     headers = _event_headers(event)
     ct_full = headers.get("content-type") or "application/json"
     ct = ct_full.split(";", 1)[0].strip().lower()
@@ -168,12 +221,14 @@ def parse_static_script_put_payload(event: dict[str, Any]) -> tuple[str, bool]:
     if ct == "multipart/form-data":
         source = _parse_multipart_source(body_bytes, ct_full)
         confirm = _confirm_overwrite_from_event(event)
-        return validate_source(source), confirm
+        is_app_config = _is_app_config_from_event(event)
+        return validate_source(source), confirm, is_app_config
 
     if ct in _RAW_JS_CONTENT_TYPES:
         source = body_bytes.decode("utf-8")
         confirm = _confirm_overwrite_from_event(event)
-        return validate_source(source), confirm
+        is_app_config = _is_app_config_from_event(event)
+        return validate_source(source), confirm, is_app_config
 
     try:
         data = json.loads(body_bytes.decode("utf-8") if body_bytes else "{}")
@@ -183,15 +238,17 @@ def parse_static_script_put_payload(event: dict[str, Any]) -> tuple[str, bool]:
         raise ValueError("body_must_be_object")
 
     confirm = _confirm_overwrite_from_event(event, bool(data.get("confirmOverwrite")))
+    body_is_app_config = bool(data["isAppConfig"]) if "isAppConfig" in data else None
+    is_app_config = _is_app_config_from_event(event, body_flag=body_is_app_config)
     if "source" in data and data["source"] is not None:
-        return validate_source(data["source"]), confirm
+        return validate_source(data["source"]), confirm, is_app_config
     b64 = data.get("sourceBase64")
     if isinstance(b64, str) and b64.strip():
         try:
             decoded = base64.b64decode(b64, validate=True).decode("utf-8")
         except (ValueError, UnicodeDecodeError) as e:
             raise ValueError("invalid_sourceBase64") from e
-        return validate_source(decoded), confirm
+        return validate_source(decoded), confirm, is_app_config
     raise ValueError("source_or_sourceBase64_required")
 
 
@@ -206,6 +263,10 @@ def _etag_for_body(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()[:32]
 
 
+def _item_is_app_config(item: dict[str, Any]) -> bool:
+    return bool(item.get("is_app_config"))
+
+
 def _item_to_summary(item: dict[str, Any]) -> dict[str, Any]:
     name = str(item.get("sk") or "")
     return {
@@ -214,6 +275,7 @@ def _item_to_summary(item: dict[str, Any]) -> dict[str, Any]:
         "updatedBy": str(item.get("updated_by") or ""),
         "byteLength": int(item.get("byte_length") or 0),
         "publicUrl": public_script_url(name),
+        "isAppConfig": _item_is_app_config(item),
     }
 
 
@@ -226,24 +288,51 @@ def _item_to_detail(item: dict[str, Any]) -> dict[str, Any]:
         "updatedBy": str(item.get("updated_by") or ""),
         "byteLength": int(item.get("byte_length") or 0),
         "publicUrl": public_script_url(name),
+        "contentSha256": str(item.get("content_sha256") or ""),
+        "isAppConfig": _item_is_app_config(item),
         "exists": True,
     }
 
 
-def list_scripts(table) -> list[dict[str, Any]]:
+def parse_is_app_config_query(qs: dict[str, Any] | None) -> tuple[bool | None, str | None]:
+    """
+    Parse ?isAppConfig= query for GET /admin/static-scripts.
+
+    Returns (filter, error):
+    - (None, None) — no filter, return all scripts
+    - (True, None) — only isAppConfig scripts
+    - (False, None) — only non-app-config scripts
+    """
+    if not qs or not isinstance(qs, dict):
+        return None, None
+    v = _truthy_query_param(qs.get("isAppConfig"))
+    if v is None and qs.get("isAppConfig") is not None:
+        return None, "invalid_isAppConfig_query"
+    return v, None
+
+
+def list_scripts(table, *, is_app_config: bool | None = None) -> list[dict[str, Any]]:
     from boto3.dynamodb.conditions import Key
 
     resp = table.query(KeyConditionExpression=Key("pk").eq(PK_GLOBAL_STATIC_JS))
     items = resp.get("Items") or []
-    while resp.get("LastEvaluatedKey"):
+    while isinstance(resp.get("LastEvaluatedKey"), dict):
         resp = table.query(
             KeyConditionExpression=Key("pk").eq(PK_GLOBAL_STATIC_JS),
             ExclusiveStartKey=resp["LastEvaluatedKey"],
         )
         items.extend(resp.get("Items") or [])
     summaries = [_item_to_summary(it) for it in items]
+    if is_app_config is True:
+        summaries = [s for s in summaries if s.get("isAppConfig")]
+    elif is_app_config is False:
+        summaries = [s for s in summaries if not s.get("isAppConfig")]
     summaries.sort(key=lambda x: x["name"])
     return summaries
+
+
+def list_app_config_scripts(table) -> list[dict[str, Any]]:
+    return list_scripts(table, is_app_config=True)
 
 
 def get_script(table, name: str) -> dict[str, Any] | None:
@@ -260,6 +349,40 @@ def script_exists(table, name: str) -> bool:
     return bool(item)
 
 
+def shops_bound_to_script(table, script_name: str) -> list[str]:
+    """Shops whose effective app-config template resolves to script_name."""
+    safe = validate_script_name(script_name)
+    from boto3.dynamodb.conditions import Key
+
+    bound: list[str] = []
+    kwargs: dict[str, Any] = {
+        "IndexName": "GSI2",
+        "KeyConditionExpression": Key("gsi2pk").eq(GSI2_PK_SHOP_INDEX),
+    }
+    resp = table.query(**kwargs)
+    items = list(resp.get("Items") or [])
+    while isinstance(resp.get("LastEvaluatedKey"), dict):
+        resp = table.query(
+            **kwargs,
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        items.extend(resp.get("Items") or [])
+    for it in items:
+        if it.get("sk") != SK_METADATA:
+            continue
+        if effective_app_config_script_name(it) != safe:
+            continue
+        shop = str(it.get("shop") or "").strip()
+        if not shop and isinstance(it.get("pk"), str):
+            pk = it["pk"]
+            if pk.startswith("SHOP#"):
+                shop = pk[5:]
+        if shop:
+            bound.append(shop)
+    bound.sort()
+    return bound
+
+
 def put_script(
     table,
     name: str,
@@ -267,6 +390,7 @@ def put_script(
     *,
     updated_by: str,
     confirm_overwrite: bool,
+    is_app_config: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     """
     Returns (created, detail dict).
@@ -275,6 +399,8 @@ def put_script(
     """
     safe = validate_script_name(name)
     text = validate_source(source)
+    if is_app_config:
+        validate_app_config_source(text)
     body = text.encode("utf-8")
     exists = script_exists(table, safe)
     if exists and not confirm_overwrite:
@@ -288,6 +414,7 @@ def put_script(
             "source": text,
             "byte_length": len(body),
             "content_sha256": _etag_for_body(body),
+            "is_app_config": bool(is_app_config),
             "updated_at": now,
             "updated_by": str(updated_by)[:500],
         }
@@ -302,6 +429,9 @@ def delete_script(table, name: str) -> bool:
     item = table.get_item(Key={"pk": PK_GLOBAL_STATIC_JS, "sk": safe}).get("Item")
     if not item:
         return False
+    bound = shops_bound_to_script(table, safe)
+    if bound:
+        raise AppConfigScriptInUseError(bound)
     table.delete_item(Key={"pk": PK_GLOBAL_STATIC_JS, "sk": safe})
     return True
 

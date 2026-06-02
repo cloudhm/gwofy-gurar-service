@@ -200,3 +200,29 @@ def test_build_effective_merges_layers():
     assert eff["text"]["sp"]["title"] == "Shop Title"
     assert eff["shopId"] == "gwo-dev.myshopify.com"
     assert eff["auth"]["isOpenForSP"] is False
+
+
+def test_script_overlay_cannot_override_derived_readonly():
+    meta = {
+        "shipping_protection_status": "OPEN_AUDITED",
+        "shop_currency_code": "USD",
+        "billing_country_code": "US",
+    }
+    table = MagicMock()
+    overlay = {
+        "shopId": "evil.myshopify.com",
+        "productHandle": "evil-handle",
+        "supportedCurrencies": ["EUR"],
+        "auth": {"isOpenForSP": False},
+    }
+    with _patch_derived_helpers():
+        eff = build_effective_gwofy_config(
+            table,
+            meta,
+            "gwo-dev.myshopify.com",
+            script_overlay=overlay,
+        )
+    assert eff["shopId"] == "gwo-dev.myshopify.com"
+    assert eff["productHandle"] == "GWOFY-SHIPPING-PROTECTION-QAQWER"
+    assert eff["supportedCurrencies"] == ["USD"]
+    assert eff["auth"]["isOpenForSP"] is True

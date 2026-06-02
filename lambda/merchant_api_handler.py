@@ -32,12 +32,12 @@ from lib.shop_enabled_currencies import parse_shop_enabled_currencies_json, sync
 from lib.static_assets import (
     APP_CONFIG_VERSION,
     APP_STOREFRONT_VERSION,
+    AppConfigTemplateNotFoundError,
     get_app_config_js_for_shop,
     get_app_storefront_asset,
 )
 from lib.static_scripts import resolve_public_script
 from lib.storefront_gwofy_config import (
-    build_effective_gwofy_config,
     is_valid_shop_host,
     shop_query_from_event,
 )
@@ -931,11 +931,11 @@ def _serve_app_config_js(event, method: str, headers: dict[str, str], table):
     if str(item.get("activation_status") or "") != "ACTIVATED":
         return _resp(403, {"error": "shop_not_activated"})
 
-    merged = build_effective_gwofy_config(
-        table, item, shop_host, storefront_js_version=APP_STOREFRONT_VERSION
-    )
     updated_at = str(item.get("updated_at") or "")
-    body, etag = get_app_config_js_for_shop(merged, shop_host, updated_at)
+    try:
+        body, etag = get_app_config_js_for_shop(table, item, shop_host, updated_at)
+    except AppConfigTemplateNotFoundError:
+        return _resp(404, {"error": "app_config_script_not_found"})
     if method == "HEAD":
         return _js_resp(200, etag=etag, version=APP_CONFIG_VERSION, cache_control=None)
     return _js_resp(200, body=body, etag=etag, version=APP_CONFIG_VERSION, cache_control=None)

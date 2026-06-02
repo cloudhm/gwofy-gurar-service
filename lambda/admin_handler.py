@@ -24,6 +24,7 @@ from lib.calc_coverage_tips_config import (
     validate_shop_tip_value,
 )
 from lib.models import (
+    APP_CONFIG_SCRIPT_NAME,
     GSI2_PK_SHOP_INDEX,
     META_SP_BELOW_MIN_COVERAGE_TIP,
     META_SP_GREATER_MAX_COVERAGE_TIP,
@@ -33,11 +34,15 @@ from lib.models import (
     pk_shop,
     pk_tenant,
 )
-from lib.static_assets import APP_STOREFRONT_VERSION
+from lib.static_assets import APP_STOREFRONT_VERSION, AppConfigTemplateNotFoundError, resolve_shop_app_config_template
 from lib.static_scripts import (
+    AppConfigScriptInUseError,
     delete_script,
+    effective_app_config_script_name,
     get_script,
+    list_app_config_scripts,
     list_scripts,
+    parse_is_app_config_query,
     parse_static_script_put_payload,
     put_script,
     script_name_rules,
@@ -47,6 +52,7 @@ from lib.storefront_gwofy_config import (
     config_layers_for_admin,
     merge_storefront_config_patch,
     normalize_storefront_config_for_storage,
+    parse_script_config_overlay,
     parse_storefront_config_from_meta,
     should_remove_storefront_config_storage,
     derived_readonly_keys_in_patch,
@@ -507,6 +513,39 @@ def _put_shop_calc_coverage_tips(event, table, shop: str, actor_sub: str, actor_
     return _resp(200, {"ok": True})
 
 
+_MISSING = object()
+
+
+def _storefront_config_response(table, meta: dict, shop: str) -> dict[str, Any]:
+    script_overlay: dict[str, Any] = {}
+    try:
+        template, _ = resolve_shop_app_config_template(table, meta)
+        script_overlay = parse_script_config_overlay(template)
+    except AppConfigTemplateNotFoundError:
+        pass
+    layers = config_layers_for_admin(
+        table,
+        meta,
+        shop,
+        storefront_js_version=APP_STOREFRONT_VERSION,
+        script_overlay=script_overlay,
+    )
+    layers["appConfigScriptName"] = effective_app_config_script_name(meta)
+    layers["appConfigScripts"] = list_app_config_scripts(table)
+    return layers
+
+
+def _validate_app_config_script_binding(table, name: str) -> str | None:
+    try:
+        safe = validate_script_name(name)
+    except ValueError:
+        return "invalid_app_config_script_name"
+    script = get_script(table, safe)
+    if not script or not script.get("isAppConfig"):
+        return "invalid_app_config_script"
+    return None
+
+
 def _get_shop_storefront_config(table, shop: str, actor_sub: str, req_id: str):
     pk = pk_shop(shop)
     meta = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item")
@@ -523,10 +562,7 @@ def _get_shop_storefront_config(table, shop: str, actor_sub: str, req_id: str):
         http_path=f"/admin/shops/{shop}/storefront-config",
         request_id=req_id,
     )
-    return _resp(
-        200,
-        config_layers_for_admin(table, meta, shop, storefront_js_version=APP_STOREFRONT_VERSION),
-    )
+    return _resp(200, _storefront_config_response(table, meta, shop))
 
 
 def _put_shop_storefront_config(event, table, shop: str, actor_sub: str, actor_email: str, req_id: str):
@@ -538,34 +574,83 @@ def _put_shop_storefront_config(event, table, shop: str, actor_sub: str, actor_e
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
         return _resp(400, {"error": "invalid_json"})
-    patch, verr = validate_storefront_config_patch(body)
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body_must_be_object"})
+
+    app_script_update = body.get("appConfigScriptName", _MISSING)
+    config_body = {k: v for k, v in body.items() if k != "appConfigScriptName"}
+
+    if config_body:
+        patch, verr = validate_storefront_config_patch(config_body)
+    else:
+        patch, verr = {}, None
+
     if verr:
         err_body: dict = {"error": "invalid_storefront_config"}
         if verr == "derived_readonly_keys":
-            err_body["detail"] = derived_readonly_keys_in_patch(body)
+            err_body["detail"] = derived_readonly_keys_in_patch(config_body)
         else:
             err_body["detail"] = verr
         return _resp(400, err_body)
-    existing = parse_storefront_config_from_meta(meta)
-    merged = merge_storefront_config_patch(existing, patch)
+
+    if app_script_update is not _MISSING:
+        if app_script_update is not None and (
+            not isinstance(app_script_update, str) or not app_script_update.strip()
+        ):
+            return _resp(400, {"error": "invalid_app_config_script_name"})
+        if app_script_update is not None:
+            bind_err = _validate_app_config_script_binding(table, app_script_update.strip())
+            if bind_err:
+                return _resp(400, {"error": bind_err, "name": app_script_update.strip()})
+    elif not patch:
+        return _resp(400, {"error": "invalid_storefront_config", "detail": "no_fields_to_update"})
+
     now = datetime.now(timezone.utc).isoformat()
-    if should_remove_storefront_config_storage(merged):
-        table.update_item(
-            Key={"pk": pk, "sk": SK_METADATA},
-            UpdateExpression="REMOVE #sc SET updated_at = :u",
-            ExpressionAttributeNames={"#sc": STOREFRONT_CONFIG_JSON},
-            ExpressionAttributeValues={":u": now},
+    expr_parts: list[str] = ["updated_at = :u"]
+    expr_names: dict[str, str] = {}
+    expr_vals: dict[str, Any] = {":u": now}
+    removes: list[str] = []
+
+    if patch:
+        existing = parse_storefront_config_from_meta(meta)
+        merged = merge_storefront_config_patch(existing, patch)
+        if should_remove_storefront_config_storage(merged):
+            removes.append("#sc")
+            expr_names["#sc"] = STOREFRONT_CONFIG_JSON
+        else:
+            expr_names["#sc"] = STOREFRONT_CONFIG_JSON
+            expr_vals[":sc"] = normalize_storefront_config_for_storage(merged)
+            expr_parts.append("#sc = :sc")
+
+    if app_script_update is not _MISSING:
+        expr_names["#acn"] = APP_CONFIG_SCRIPT_NAME
+        if app_script_update is None:
+            removes.append("#acn")
+        else:
+            expr_vals[":acn"] = validate_script_name(str(app_script_update).strip())
+            expr_parts.append("#acn = :acn")
+
+    update_expr = "SET " + ", ".join(expr_parts)
+    if removes:
+        update_expr = "REMOVE " + ", ".join(removes) + " " + update_expr
+
+    update_kwargs: dict[str, Any] = {
+        "Key": {"pk": pk, "sk": SK_METADATA},
+        "UpdateExpression": update_expr,
+        "ExpressionAttributeValues": expr_vals,
+    }
+    if expr_names:
+        update_kwargs["ExpressionAttributeNames"] = expr_names
+    table.update_item(**update_kwargs)
+
+    audit_detail: dict[str, Any] = {}
+    if patch:
+        audit_detail["patch_keys"] = sorted(patch.keys())
+    if app_script_update is not _MISSING:
+        audit_detail["appConfigScriptName"] = (
+            None if app_script_update is None else validate_script_name(str(app_script_update).strip())
         )
-    else:
-        table.update_item(
-            Key={"pk": pk, "sk": SK_METADATA},
-            UpdateExpression="SET #sc = :sc, updated_at = :u",
-            ExpressionAttributeNames={"#sc": STOREFRONT_CONFIG_JSON},
-            ExpressionAttributeValues={
-                ":sc": normalize_storefront_config_for_storage(merged),
-                ":u": now,
-            },
-        )
+
     append_audit(
         table,
         shop,
@@ -575,20 +660,12 @@ def _put_shop_storefront_config(event, table, shop: str, actor_sub: str, actor_e
         outcome="ok",
         resource="storefront_config",
         actor_email=actor_email or None,
-        detail={"patch_keys": sorted(patch.keys())},
+        detail=audit_detail,
         http_path=f"/admin/shops/{shop}/storefront-config",
         request_id=req_id,
     )
     refreshed = table.get_item(Key={"pk": pk, "sk": SK_METADATA}).get("Item") or meta
-    return _resp(
-        200,
-        {
-            "ok": True,
-            **config_layers_for_admin(
-                table, refreshed, shop, storefront_js_version=APP_STOREFRONT_VERSION
-            ),
-        },
-    )
+    return _resp(200, {"ok": True, **_storefront_config_response(table, refreshed, shop)})
 
 
 def _put_tips_info(event, table, actor_sub: str, actor_email: str, req_id: str):
@@ -1103,6 +1180,86 @@ def _is_primary_product_mirror_sk(sk: str) -> bool:
     return s.startswith("PRODUCT#") and "#META_VER#" not in s
 
 
+def _decode_list_cursor(cursor_b64: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not cursor_b64:
+        return None, None
+    try:
+        return json.loads(base64.urlsafe_b64decode(cursor_b64.encode("ascii")).decode("utf-8")), None
+    except Exception:
+        return None, "invalid_cursor"
+
+
+def _encode_list_cursor(lek: dict[str, Any] | None) -> str | None:
+    if not lek:
+        return None
+    return base64.urlsafe_b64encode(json.dumps(lek, default=str).encode("utf-8")).decode("ascii")
+
+
+def _iso8601_query_value(qs: dict[str, Any], key: str) -> tuple[str | None, str | None]:
+    raw = (qs.get(key) or "").strip()
+    if not raw:
+        return None, None
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        datetime.fromisoformat(normalized)
+    except ValueError:
+        return None, key
+    return raw, None
+
+
+def _query_tenant_mirror_page(
+    table,
+    *,
+    pk_t: str,
+    sk_prefix: str,
+    limit: int,
+    exclusive_start_key: dict[str, Any] | None,
+    filt: list[str],
+    names: dict[str, str],
+    vals: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    kwargs: dict[str, Any] = {
+        "KeyConditionExpression": "pk = :p AND begins_with(sk, :pre)",
+        "ExpressionAttributeValues": {**vals, ":p": pk_t, ":pre": sk_prefix},
+        "Limit": limit,
+    }
+    if exclusive_start_key:
+        kwargs["ExclusiveStartKey"] = exclusive_start_key
+    if filt:
+        kwargs["FilterExpression"] = " AND ".join(filt)
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    resp = table.query(**kwargs)
+    return resp.get("Items", []), resp.get("LastEvaluatedKey")
+
+
+def _tenant_mirror_list_response(
+    table,
+    *,
+    pk_t: str,
+    sk_prefix: str,
+    limit: int,
+    cursor_b64: str,
+    filt: list[str],
+    names: dict[str, str],
+    vals: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None, str | None]:
+    eks, err = _decode_list_cursor(cursor_b64)
+    if err:
+        return [], None, err
+    items, lek = _query_tenant_mirror_page(
+        table,
+        pk_t=pk_t,
+        sk_prefix=sk_prefix,
+        limit=limit,
+        exclusive_start_key=eks,
+        filt=filt,
+        names=names,
+        vals=vals,
+    )
+    return items, _encode_list_cursor(lek), None
+
+
 def _list_products(event, table, shop: str, actor_sub: str, req_id: str):
     qs = event.get("queryStringParameters") or {}
     include_deleted = (qs.get("include_deleted") or "").lower() in ("1", "true", "yes")
@@ -1113,8 +1270,8 @@ def _list_products(event, table, shop: str, actor_sub: str, req_id: str):
     sn = str(meta.get("store_number", ""))
     pk_t = pk_tenant(sn)
     names: dict[str, str] = {}
-    vals: dict[str, Any] = {":p": pk_t, ":pre": "PRODUCT#"}
-    filt: list[str] = []
+    vals: dict[str, Any] = {}
+    filt: list[str] = ["attribute_exists(product_handle)"]
     if not include_deleted:
         names["#sd"] = "sync_deleted"
         filt.append("(attribute_not_exists(#sd) OR #sd = :fv)")
@@ -1122,40 +1279,48 @@ def _list_products(event, table, shop: str, actor_sub: str, req_id: str):
     if prefix := (qs.get("product_handle_prefix") or "").strip():
         filt.append("begins_with(product_handle, :hpre)")
         vals[":hpre"] = prefix
+    if title_prefix := (qs.get("product_title_prefix") or "").strip():
+        filt.append("begins_with(product_title, :tpre)")
+        vals[":tpre"] = title_prefix
     if pst := (qs.get("product_status") or "").strip():
         filt.append("product_status = :pst")
         vals[":pst"] = pst.upper()
-    kwargs: dict[str, Any] = {
-        "KeyConditionExpression": "pk = :p AND begins_with(sk, :pre)",
-        "ExpressionAttributeValues": vals,
-        # Over-fetch; exclude META_VER rows in memory (sk cannot appear in FilterExpression).
-        "Limit": min(limit * 3, 500),
-    }
-    if filt:
-        kwargs["FilterExpression"] = " AND ".join(filt)
-    if names:
-        kwargs["ExpressionAttributeNames"] = names
-    resp = table.query(**kwargs)
-    items = [
-        x
-        for x in resp.get("Items", [])
-        if _is_primary_product_mirror_sk(str(x.get("sk") or ""))
-    ][:limit]
-    return _resp(200, {"items": items})
+    if sku := (qs.get("sku") or "").strip():
+        filt.append("contains(variant_skus, :vsku)")
+        vals[":vsku"] = sku
+    if asin := (qs.get("asin") or qs.get("barcode") or "").strip():
+        filt.append("contains(variant_barcodes, :vbc)")
+        vals[":vbc"] = asin
+    items, next_cursor, err = _tenant_mirror_list_response(
+        table,
+        pk_t=pk_t,
+        sk_prefix="PRODUCT#",
+        limit=limit,
+        cursor_b64=qs.get("cursor") or "",
+        filt=filt,
+        names=names,
+        vals=vals,
+    )
+    if err:
+        return _resp(400, {"error": err})
+    return _resp(200, {"items": items, "next_cursor": next_cursor})
 
 
 def _list_orders(event, table, shop: str, actor_sub: str, req_id: str):
     qs = event.get("queryStringParameters") or {}
-    only_prot = (qs.get("only_protection") or "").lower() in ("1", "true", "yes")
+    only_prot = (qs.get("only_protection") or qs.get("has_shipping_protection") or "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     include_deleted = (qs.get("include_deleted") or "").lower() in ("1", "true", "yes")
-    tag_filter = (qs.get("tag") or "").strip()
     meta = table.get_item(Key={"pk": pk_shop(shop), "sk": SK_METADATA}).get("Item")
     if not meta:
         return _resp(404, {"error": "not_found"})
     sn = str(meta.get("store_number", ""))
     pk_t = pk_tenant(sn)
     names: dict[str, str] = {}
-    vals: dict[str, Any] = {":p": pk_t, ":pre": "ORDER#"}
+    vals: dict[str, Any] = {}
     filt: list[str] = []
     if not include_deleted:
         names["#sd"] = "sync_deleted"
@@ -1167,23 +1332,53 @@ def _list_orders(event, table, shop: str, actor_sub: str, req_id: str):
     if fs := (qs.get("financial_status") or "").strip():
         filt.append("display_financial_status = :dfs")
         vals[":dfs"] = fs.upper()
-    if onp := (qs.get("order_name_prefix") or "").strip():
+    if ffs := (qs.get("fulfillment_status") or "").strip():
+        filt.append("display_fulfillment_status = :ffs")
+        vals[":ffs"] = ffs.upper()
+    if on := (qs.get("order_name") or "").strip():
+        filt.append("order_name = :on")
+        vals[":on"] = on
+    elif onp := (qs.get("order_name_prefix") or "").strip():
         filt.append("begins_with(order_name, :onp)")
         vals[":onp"] = onp
-    kwargs: dict[str, Any] = {
-        "KeyConditionExpression": "pk = :p AND begins_with(sk, :pre)",
-        "ExpressionAttributeValues": vals,
-        "Limit": min(int(qs.get("limit") or 100), 500),
-    }
-    if filt:
-        kwargs["FilterExpression"] = " AND ".join(filt)
-    if names:
-        kwargs["ExpressionAttributeNames"] = names
-    resp = table.query(**kwargs)
-    items = resp.get("Items", [])
-    if tag_filter:
-        items = [x for x in items if tag_filter in (x.get("sync_tags") or [])]
-    return _resp(200, {"items": items})
+    if lrid := (qs.get("legacy_resource_id") or qs.get("order_number") or "").strip():
+        filt.append("legacy_resource_id = :lrid")
+        vals[":lrid"] = lrid
+    if tag_filter := (qs.get("tag") or "").strip():
+        filt.append("contains(sync_tags, :tg)")
+        vals[":tg"] = tag_filter
+    if sku := (qs.get("sku") or "").strip():
+        filt.append("contains(line_item_skus, :lsku)")
+        vals[":lsku"] = sku
+    for key, attr, op in (
+        ("created_from", "order_created_at", ">="),
+        ("created_to", "order_created_at", "<="),
+        ("processed_from", "order_processed_at", ">="),
+        ("processed_to", "order_processed_at", "<="),
+        ("updated_from", "updated_at_source", ">="),
+        ("updated_to", "updated_at_source", "<="),
+    ):
+        raw, bad = _iso8601_query_value(qs, key)
+        if bad:
+            return _resp(400, {"error": "invalid_date", "field": bad})
+        if raw:
+            placeholder = f":{key.replace('_', '')}"
+            filt.append(f"{attr} {op} {placeholder}")
+            vals[placeholder] = raw
+    limit = min(int(qs.get("limit") or 100), 500)
+    items, next_cursor, err = _tenant_mirror_list_response(
+        table,
+        pk_t=pk_t,
+        sk_prefix="ORDER#",
+        limit=limit,
+        cursor_b64=qs.get("cursor") or "",
+        filt=filt,
+        names=names,
+        vals=vals,
+    )
+    if err:
+        return _resp(400, {"error": err})
+    return _resp(200, {"items": items, "next_cursor": next_cursor})
 
 
 def _list_audit(event, table, shop: str, actor_sub: str, req_id: str):
@@ -1283,7 +1478,17 @@ def _handle_admin_static_scripts(
     req_id: str,
 ):
     if method == "GET" and len(parts) == 2:
-        return _resp(200, {"scripts": list_scripts(table), "nameRules": script_name_rules()})
+        qs = event.get("queryStringParameters") or {}
+        is_app_config_filter, qerr = parse_is_app_config_query(qs if isinstance(qs, dict) else None)
+        if qerr:
+            return _resp(400, {"error": qerr})
+        body: dict[str, Any] = {
+            "scripts": list_scripts(table, is_app_config=is_app_config_filter),
+            "nameRules": script_name_rules(),
+        }
+        if is_app_config_filter is not None:
+            body["isAppConfigFilter"] = is_app_config_filter
+        return _resp(200, body)
 
     if len(parts) != 3:
         return _resp(404, {"error": "not_found"})
@@ -1310,7 +1515,17 @@ def _handle_admin_static_scripts(
         return _resp(200, detail)
 
     if method == "DELETE":
-        deleted = delete_script(table, name)
+        try:
+            deleted = delete_script(table, name)
+        except AppConfigScriptInUseError as e:
+            return _resp(
+                409,
+                {
+                    "error": "app_config_script_in_use",
+                    "name": name,
+                    "boundShops": e.bound_shops,
+                },
+            )
         if not deleted:
             return _resp(404, {"error": "not_found", "name": name})
         append_audit(
@@ -1330,7 +1545,7 @@ def _handle_admin_static_scripts(
 
     if method == "PUT":
         try:
-            source, confirm = parse_static_script_put_payload(event)
+            source, confirm, is_app_config = parse_static_script_put_payload(event)
         except ValueError as e:
             code = str(e)
             if code in ("invalid_json", "body_must_be_object", "source_or_sourceBase64_required"):
@@ -1345,6 +1560,7 @@ def _handle_admin_static_scripts(
                 source,
                 updated_by=actor_sub,
                 confirm_overwrite=confirm,
+                is_app_config=is_app_config,
             )
         except FileExistsError:
             return _resp(
@@ -1366,6 +1582,12 @@ def _handle_admin_static_scripts(
                         "nameRules": script_name_rules(),
                     },
                 )
+            if code in (
+                "app_config_missing_gwofy_config",
+                "app_config_missing_gwofy_config_assignment",
+                "app_config_missing_inject_marker",
+            ):
+                return _resp(400, {"error": "invalid_app_config", "detail": code})
             return _resp(400, {"error": "invalid_static_script", "detail": code})
         action = "ADMIN_STATIC_SCRIPT_CREATE" if created else "ADMIN_STATIC_SCRIPT_UPDATE"
         append_audit(

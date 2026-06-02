@@ -57,6 +57,7 @@ def test_get_storefront_config():
 
     tbl = MagicMock()
     tbl.get_item.return_value = {"Item": _meta()}
+    tbl.query.return_value = {"Items": []}
 
     with (
         patch("admin_handler.admin_in_required_group", return_value=(True, "GWOFY-SHIPPING-PROTECTION")),
@@ -71,6 +72,8 @@ def test_get_storefront_config():
     assert body["shop"] == "gwo-dev.myshopify.com"
     assert "defaults" in body
     assert "effective" in body
+    assert body["appConfigScriptName"] == "app-config.js"
+    assert body["appConfigScripts"] == []
 
 
 def test_put_storefront_config_text():
@@ -78,6 +81,7 @@ def test_put_storefront_config_text():
 
     tbl = MagicMock()
     tbl.get_item.return_value = {"Item": _meta()}
+    tbl.query.return_value = {"Items": []}
 
     with (
         patch("admin_handler.admin_in_required_group", return_value=(True, "GWOFY-SHIPPING-PROTECTION")),
@@ -105,7 +109,14 @@ def test_put_accepts_pricing_calc_rate():
         **before,
         "storefront_config_json": '{"pricing":{"calcRate":"0.05"}}',
     }
-    tbl.get_item.side_effect = [{"Item": before}, {"Item": after}]
+
+    def fake_get_item(Key, **_kwargs):
+        if Key.get("sk") == "METADATA":
+            return {"Item": after}
+        return {}
+
+    tbl.get_item.side_effect = fake_get_item
+    tbl.query.return_value = {"Items": []}
 
     with (
         patch("admin_handler.admin_in_required_group", return_value=(True, "GWOFY-SHIPPING-PROTECTION")),

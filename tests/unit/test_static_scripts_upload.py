@@ -113,6 +113,53 @@ def test_parse_static_script_put_payload_multipart():
         "body": body.decode("latin-1"),
         "queryStringParameters": {"confirmOverwrite": "true"},
     }
-    source, confirm = parse_static_script_put_payload(event)
+    source, confirm, is_app_config = parse_static_script_put_payload(event)
     assert "var uploaded = 1" in source
     assert confirm is True
+    assert is_app_config is False
+
+
+def test_parse_raw_js_is_app_config_from_query():
+    from lib.static_scripts import parse_static_script_put_payload
+
+    source = "g.GWOFY_CONFIG = Object.assign({}, /*__GWOFY_CONFIG_JSON__*/);"
+    event = {
+        "headers": {"content-type": "application/javascript"},
+        "body": source,
+        "queryStringParameters": {"isAppConfig": "true", "confirmOverwrite": "true"},
+    }
+    parsed_source, confirm, is_app_config = parse_static_script_put_payload(event)
+    assert parsed_source == source
+    assert confirm is True
+    assert is_app_config is True
+
+
+def test_put_raw_javascript_is_app_config_from_query():
+    from admin_handler import handler
+
+    tbl, store = _mock_table()
+    js = "g.GWOFY_CONFIG = Object.assign({}, /*__GWOFY_CONFIG_JSON__*/);"
+
+    with (
+        patch("admin_handler.admin_in_required_group", return_value=(True, "GWOFY-SHIPPING-PROTECTION")),
+        patch("admin_handler.ddb.Table", return_value=tbl),
+        patch("admin_handler.append_audit"),
+    ):
+        out = handler(
+            {
+                "requestContext": {
+                    "http": {"method": "PUT", "path": "/admin/static-scripts/app-config-z3.js"},
+                    "requestId": "r1",
+                    "authorizer": {"jwt": {"claims": {"sub": "admin1"}}},
+                },
+                "headers": {"content-type": "application/javascript"},
+                "body": js,
+                "queryStringParameters": {"isAppConfig": "true", "confirmOverwrite": "true"},
+            },
+            None,
+        )
+
+    assert out["statusCode"] == 201
+    body = json.loads(out["body"])
+    assert body["isAppConfig"] is True
+    assert store[("GLOBAL#STATIC_JS", "app-config-z3.js")]["is_app_config"] is True

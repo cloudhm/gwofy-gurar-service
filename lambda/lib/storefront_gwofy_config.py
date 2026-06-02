@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .default_protection_tiers import PROTECTION_PRODUCT_HANDLE
+from .gwofy_config_js_transform import inject_gwofy_config_into_template, parse_script_config_overlay
 from .models import META_PROTECTION_PRODUCT_HANDLE, STOREFRONT_CONFIG_JSON, pk_tenant
 from .shop_enabled_currencies import shop_supported_currencies_list
 from .tips_config import get_tips_info
 
-_CONFIG_INJECT_MARKER = "/*__GWOFY_CONFIG_JSON__*/"
+CONFIG_INJECT_MARKER = "/*__GWOFY_CONFIG_JSON__*/"
+DEFAULT_APP_CONFIG_SCRIPT_NAME = "app-config.js"
 _KERNEL_PATH = Path(__file__).resolve().parent.parent / "static" / "app-config.kernel.js"
 _DEFAULTS_PATH = Path(__file__).resolve().parent / "storefront_gwofy_defaults.json"
 
@@ -246,19 +248,38 @@ def apply_default_remote_script_urls_if_needed(
     return out
 
 
+def _apply_derived_readonly(merged: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(merged)
+    out["shopId"] = derived["shopId"]
+    out["productHandle"] = derived["productHandle"]
+    out["supportedCurrencies"] = copy.deepcopy(derived["supportedCurrencies"])
+    auth = out.get("auth")
+    if not isinstance(auth, dict):
+        auth = {}
+        out["auth"] = auth
+    derived_auth = derived.get("auth")
+    if isinstance(derived_auth, dict):
+        auth["isOpenForSP"] = derived_auth.get("isOpenForSP")
+    return out
+
+
 def build_effective_gwofy_config(
     table,
     meta: dict[str, Any],
     shop_host: str,
     *,
     storefront_js_version: str = _DEFAULT_STOREFRONT_JS_VERSION,
+    script_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     _ = storefront_js_version
     base = default_gwofy_config()
     derived = derived_from_meta(table, meta, shop_host)
     override = parse_storefront_config_from_meta(meta)
-    merged = _deep_merge(base, derived)
+    overlay = script_overlay or {}
+    merged = _deep_merge(base, overlay)
     merged = _deep_merge(merged, override)
+    merged = _deep_merge(merged, derived)
+    merged = _apply_derived_readonly(merged, derived)
     return apply_default_remote_script_urls_if_needed(merged, meta)
 
 
@@ -473,16 +494,23 @@ def config_layers_for_admin(
     shop_host: str,
     *,
     storefront_js_version: str = _DEFAULT_STOREFRONT_JS_VERSION,
+    script_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     defaults = apply_default_remote_script_urls_if_needed(default_gwofy_config(), None)
     derived = derived_from_meta(table, meta, shop_host)
     shop_override = parse_storefront_config_from_meta(meta)
+    overlay = script_overlay or {}
     effective = build_effective_gwofy_config(
-        table, meta, shop_host, storefront_js_version=storefront_js_version
+        table,
+        meta,
+        shop_host,
+        storefront_js_version=storefront_js_version,
+        script_overlay=overlay,
     )
     return {
         "shop": shop_host,
         "defaults": defaults,
+        "scriptOverlay": overlay,
         "derived": derived,
         "shopOverride": shop_override,
         "effective": effective,
@@ -494,10 +522,13 @@ def etag_for_app_config(
     shop_host: str,
     merged_config: dict[str, Any],
     updated_at: str,
+    *,
+    template_fingerprint: str = "",
 ) -> str:
     payload = json.dumps(
         {
             "v": kernel_version,
+            "tpl": template_fingerprint,
             "shop": shop_host,
             "config": merged_config,
             "updated_at": updated_at,
@@ -514,14 +545,16 @@ def storefront_asset_base_url() -> str:
     return base
 
 
+def build_app_config_js_from_template(template_source: str, merged_config: dict[str, Any]) -> str:
+    return inject_gwofy_config_into_template(template_source, merged_config)
+
+
 def build_app_config_js(
     merged_config: dict[str, Any],
     *,
     kernel_version: str,
     storefront_js_version: str,
 ) -> str:
+    _ = kernel_version, storefront_js_version
     kernel = _KERNEL_PATH.read_text(encoding="utf-8")
-    if _CONFIG_INJECT_MARKER not in kernel:
-        raise ValueError("app-config.kernel.js missing inject marker")
-    config_json = json.dumps(merged_config, ensure_ascii=False)
-    return kernel.replace(_CONFIG_INJECT_MARKER, config_json)
+    return build_app_config_js_from_template(kernel, merged_config)

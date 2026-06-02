@@ -25,6 +25,7 @@ from aws_cdk import aws_route53_targets as route53_targets
 from aws_cdk.custom_resources import Provider
 from constructs import Construct
 
+from gwofy_guard_service.deploy_config import resolve_admin_cognito_jwt_audiences
 from gwofy_guard_service.storage_stack import StorageStack
 
 
@@ -185,6 +186,10 @@ class ApiStack(Stack):
             self.node.try_get_context("admin_cognito_client_id")
             or os.environ.get("ADMIN_COGNITO_CLIENT_ID", "")
         ).strip()
+        admin_client_ids_extra = (
+            self.node.try_get_context("admin_cognito_client_ids")
+            or os.environ.get("ADMIN_COGNITO_CLIENT_IDS", "")
+        ).strip()
         admin_cognito_region = (
             self.node.try_get_context("admin_cognito_region") or os.environ.get("ADMIN_COGNITO_REGION", "")
         ).strip() or Stack.of(self).region
@@ -241,6 +246,23 @@ class ApiStack(Stack):
                 },
             )
             resolved_admin_client_id = cognito_client_cr.get_att_string("ClientId")
+
+        # Custom Resource ClientId is a deploy-time token; cannot dedupe against literal extras at synth.
+        if admin_client_ids_extra and not admin_client_id:
+            jwt_audiences = resolve_admin_cognito_jwt_audiences(
+                primary_client_id="",
+                extra_client_ids=admin_client_ids_extra,
+            )
+            if not jwt_audiences:
+                raise ValueError(
+                    "ADMIN_COGNITO_CLIENT_IDS (or admin_cognito_client_ids) must list at least one app client "
+                    "when ADMIN_COGNITO_CLIENT_ID is omitted (include GWO-SHIPPING-PROTECTION client if used)."
+                )
+        else:
+            jwt_audiences = resolve_admin_cognito_jwt_audiences(
+                primary_client_id=resolved_admin_client_id,
+                extra_client_ids=admin_client_ids_extra,
+            )
 
         _wb = (
             (webhook_base_url or "").strip()
@@ -421,7 +443,7 @@ class ApiStack(Stack):
         admin_jwt = apigwv2_authorizers.HttpJwtAuthorizer(
             "AdminJwtAuthorizer",
             issuer,
-            jwt_audience=[resolved_admin_client_id],
+            jwt_audience=jwt_audiences,
             identity_source=["$request.header.Authorization"],
         )
 
@@ -624,7 +646,16 @@ class ApiStack(Stack):
             self,
             "AdminCognitoUserPoolClientId",
             value=resolved_admin_client_id,
-            description="Cognito app client ID for JWT aud (explicit or ensured as GWO-SHIPPING-PROTECTION)",
+            description=(
+                "Primary Cognito app client (Hosted UI /auth/callback and first JWT aud; "
+                "explicit or ensured as GWO-SHIPPING-PROTECTION)"
+            ),
+        )
+        CfnOutput(
+            self,
+            "AdminCognitoUserPoolClientIds",
+            value=",".join(jwt_audiences),
+            description="All Cognito app client IDs accepted as JWT aud for /admin",
         )
         CfnOutput(
             self,

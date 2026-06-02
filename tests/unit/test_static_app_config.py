@@ -133,14 +133,12 @@ def test_app_config_no_cache_control():
 
 def test_if_none_match_always_returns_200_body():
     from lib.static_assets import get_app_config_js_for_shop
-    from lib.storefront_gwofy_config import build_effective_gwofy_config
     from merchant_api_handler import handler
 
     meta = _activated_meta()
     tbl = MagicMock()
     tbl.get_item.return_value = {"Item": meta}
-    merged = build_effective_gwofy_config(tbl, meta, "gwo-dev.myshopify.com")
-    body, etag = get_app_config_js_for_shop(merged, "gwo-dev.myshopify.com", meta["updated_at"])
+    body, etag = get_app_config_js_for_shop(tbl, meta, "gwo-dev.myshopify.com", meta["updated_at"])
 
     with patch("merchant_api_handler.ddb.Table", return_value=tbl):
         out = handler(

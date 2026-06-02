@@ -82,7 +82,8 @@ GitHub → **Settings → Secrets and variables → Actions → New repository s
 | `SHOPIFY_CLIENT_ID` | Partner 应用 Client ID |
 | `SHOPIFY_CLIENT_SECRET` | Partner 应用 Secret |
 | `ADMIN_COGNITO_USER_POOL_ID` | 已有 Cognito User Pool ID（与 Api 栈 JWT 一致） |
-| `ADMIN_COGNITO_CLIENT_ID` | **可选**。省略时部署会在该 Pool 内 **创建或复用** 名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client，并将其 ID 作为 JWT `aud`（见栈输出 `AdminCognitoUserPoolClientId`）。若你方已建好 Client，可填此项以跳过 Custom Resource。 |
+| `ADMIN_COGNITO_CLIENT_ID` | **可选**。省略时部署会在该 Pool 内 **创建或复用** 名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client，并将其 ID 作为 JWT `aud` 之一（见栈输出 `AdminCognitoUserPoolClientId`）。若你方已建好 Client，可填此项以跳过 Custom Resource。 |
+| `ADMIN_COGNITO_CLIENT_IDS` | **可选**。同一 User Pool 下 **额外** 允许的 App Client ID（逗号或空格分隔）；Id token 的 `aud` 匹配 **主 Client 或列表中任一** 即可调 `/admin`。见栈输出 `AdminCognitoUserPoolClientIds`。**若未设 `ADMIN_COGNITO_CLIENT_ID`**，须在此列出 **全部** 允许的 Client（含 `GWO-SHIPPING-PROTECTION` 对应 ID），否则会与 Custom Resource 主 Client 重复导致部署失败。 |
 | `GWOFY_API_CERTIFICATE_ARN` | `ap-east-1` 的 ACM 证书 ARN |
 
 区域可通过 workflow 里写死 `ap-east-1`，或再加 Secret `AWS_REGION`。
@@ -139,12 +140,13 @@ jobs:
    export SHOPIFY_CLIENT_SECRET=...
    export ADMIN_COGNITO_USER_POOL_ID=...   # 例 us-east-1_xxxx
    # 可选：export ADMIN_COGNITO_CLIENT_ID=...  # 已有 App Client；不设则自动确保名为 GWO-SHIPPING-PROTECTION 的 Client
+   # 可选：export ADMIN_COGNITO_CLIENT_IDS=client-a,client-b  # 同 Pool 下额外允许的 App Client（JWT aud）
    # 若 Pool 不在 Api 栈部署区域，再设：export ADMIN_COGNITO_REGION=ap-east-1
    ```
 
    可选：`WEBHOOK_BASE_URL`（与 API Gateway 根 URL 同源，例如 `https://xxxx.execute-api.region.amazonaws.com`）、`POST_INSTALL_REDIRECT_URL`、`FEISHU_WEBHOOK_URL`。
 
-   也可使用 CDK context：`-c shopify_client_id=... -c shopify_client_secret=... -c webhook_base_url=...`，以及 **`-c admin_cognito_user_pool_id=...`**（可选 `-c admin_cognito_client_id=...`、`-c admin_cognito_region=...`）。
+   也可使用 CDK context：`-c shopify_client_id=... -c shopify_client_secret=... -c webhook_base_url=...`，以及 **`-c admin_cognito_user_pool_id=...`**（可选 `-c admin_cognito_client_id=...`、`-c admin_cognito_client_ids=...`、`-c admin_cognito_region=...`）。
 
 3. 合成 / 部署（默认 `stage=dev`，栈名为 `GwofyGuardStorage-dev` / `GwofyGuardApi-dev`）：
 
@@ -253,7 +255,7 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 
 与 `POST /api/cart-config` **解耦**；响应中**不**下发脚本 URL。主题在 Liquid 中加载 **`app-config.js`**（按店铺注入 `GWOFY_CONFIG`），由配置层 bootstrap 后再加载 **`app-storefront.js`** 并执行 `GwofyStorefront.init()`。店铺**未**在 `storefront_config_json` 中配置 `remoteScriptUrls` 时，effective 默认为 **`["https://sp-prod.gwofy.com/static/app-storefront.js"]`**；bootstrap 会将其中匹配 `/static/app-storefront.js` 的 URL 从「远程补丁」链中排除，仅在 `finalizeConfig` 后由 `loadStorefront` 加载一次。主题也可在 **`app-config.js` 之前** 用 Liquid 设置 `window.GWOFY_STOREFRONT_ASSET_URL` 覆盖该 URL。
 
-**Admin 全局 JS 管理**（仅 Cognito 管理组，**不可**经商户 Session API 或公开静态路由写入）：`GET /admin/static-scripts` 列出已上传脚本；`GET /admin/static-scripts/{name}` 读取全文供编辑；`PUT /admin/static-scripts/{name}` 新建/保存（单文件上限约 **350KB**）；`DELETE /admin/static-scripts/{name}` 删除上传。店面 **`GET|HEAD /static/{name}.js`** 为**只读**：优先 DynamoDB 上传内容，无上传时 `app-storefront.js` 回退 Lambda 内置文件。
+**Admin 全局 JS 管理**（仅 Cognito 管理组，**不可**经商户 Session API 或公开静态路由写入）：`GET /admin/static-scripts` 列出已上传脚本（可选 query **`isAppConfig=true|false`** 按 app-config 类型过滤）；`GET /admin/static-scripts/{name}` 读取全文供编辑；`PUT /admin/static-scripts/{name}` 新建/保存（单文件上限约 **350KB**）；`DELETE /admin/static-scripts/{name}` 删除上传。店面 **`GET|HEAD /static/{name}.js`** 为**只读**：优先 DynamoDB 上传内容，无上传时 `app-storefront.js` 回退 Lambda 内置文件。
 
 **脚本文件名 `{name}` 规则**（`PUT/GET/DELETE /admin/static-scripts/{name}`；`GET /admin/static-scripts` 响应含 **`nameRules`** 对象）：
 
@@ -261,21 +263,22 @@ python3 scripts/check_gwofy_deploy.py --stage dev
 |------|------|
 | 格式 | 正则 `^[a-zA-Z0-9][a-zA-Z0-9._-]*\.js$`：以 **ASCII 字母或数字** 开头，仅含 **字母、数字、`.`、`_`、`-`**，且必须以 **`.js`** 结尾 |
 | 禁止 | **空格**、**中文及其他非 ASCII**、路径符 **`/` `\` `..`** |
-| 保留名 | **`app-config.js`** 不可上传（该脚本由 `/static/app-config.js?shop=` 按店铺动态生成，不走上传表） |
 | 长度 | 最多 **128** 字符 |
-| 合法示例 | `store1.js`、`patch-v2.js`、`app.storefront.js` |
-| 非法示例 | `app-config.js`、`store 1.js`、`店铺.js` |
+| 合法示例 | `store1.js`、`patch-v2.js`、`app-config.js`、`app.storefront.js` |
+| 非法示例 | `store 1.js`、`店铺.js` |
 
-违反规则 → **400** `invalid_script_name` + `detail`（如 `script_name_reserved`、`script_name_whitespace`、`script_name_non_ascii`）。
+违反规则 → **400** `invalid_script_name` + `detail`（如 `script_name_whitespace`、`script_name_non_ascii`）。
+
+**App-config 脚本**（`PUT` 时 `"isAppConfig": true`，JSON body 或 query **`?isAppConfig=true`** 或头 **`X-Is-App-Config: true`**）：须含 **`g.GWOFY_CONFIG = ...`** 赋值（**不要求** `/*__GWOFY_CONFIG_JSON__*/`；仍兼容 kernel marker 写法）。上传时可保留注释、`buildDefaultGwofyStyles()` 等 JS 表达式；**下发** `/static/app-config.js?shop=` 时会解析模板中的可序列化配置，与 **`storefront_config_json`（Admin）** 及 **derived（店铺域名/商品 handle/货币/SP 授权）** 合并后，替换 `g.GWOFY_CONFIG` 赋值右侧。`shopId` / `productHandle` / `supportedCurrencies` / `auth.isOpenForSP` 始终来自后端 derived。列表/详情响应含 **`isAppConfig`**。删除时若仍有店铺绑定 → **409** `app_config_script_in_use` + `boundShops`。
 
 **`PUT /admin/static-scripts/{name}` 上传方式**（任选其一；`{name}` 须符合上表）：
 
 | 方式 | Content-Type | Body |
 |------|----------------|------|
-| JSON 文本 | `application/json` | `{"source":"<完整 JS 字符串>","confirmOverwrite":false}` |
-| JSON Base64 | `application/json` | `{"sourceBase64":"<文件 Base64>","confirmOverwrite":false}` |
-| 原始 JS 文件 | `application/javascript` 或 `text/javascript` | **请求体即为整个 .js 文件内容**；覆盖确认用 query `?confirmOverwrite=true` 或头 `X-Confirm-Overwrite: true` |
-| 表单上传 | `multipart/form-data` | 字段名 **`file`**（或 `source`）为文件；覆盖确认同上 |
+| JSON 文本 | `application/json` | `{"source":"<完整 JS 字符串>","confirmOverwrite":false,"isAppConfig":false}` |
+| JSON Base64 | `application/json` | `{"sourceBase64":"<文件 Base64>","confirmOverwrite":false,"isAppConfig":false}` |
+| 原始 JS 文件 | `application/javascript` 或 `text/javascript` | **请求体即为整个 .js 文件内容**；覆盖确认 query `?confirmOverwrite=true` 或头 `X-Confirm-Overwrite: true`；app-config 标记 query `?isAppConfig=true` 或头 `X-Is-App-Config: true` |
+| 表单上传 | `multipart/form-data` | 字段名 **`file`**（或 `source`）为文件；覆盖确认与 app-config 标记同上（query 或头） |
 
 示例（直接上传本地 `store1.js` 文件内容）：
 
@@ -298,8 +301,8 @@ curl -X PUT "https://sp-prod.gwofy.com/admin/static-scripts/store1.js" \
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET, HEAD | `/static/app-config.js` | **无 JWT / 无 HMAC**。Query **必填** `shop`（或别名 `shopId`）= `*.myshopify.com` 主机名。按店铺合并默认配置、`METADATA` 运营字段（费率/保额/提示/开关等）与 `storefront_config_json` 后返回 `lambda/static/app-config.kernel.js` + 注入的 `GWOFY_CONFIG`（`Content-Type: application/javascript`）。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。响应头 **`X-Gwofy-Asset-Version`**（`APP_CONFIG_VERSION`）、**`ETag`**（按店铺配置 hash，仅作校验/调试）；**不下发** `Cache-Control`，**不支持** `If-None-Match` → 304（每次返回完整脚本，便于运营改 `storefront_config_json` 后立即生效）。示例：`/static/app-config.js?shop=gwo-dev.myshopify.com`。**发版**：改 kernel / 默认 JSON → bump `APP_CONFIG_VERSION` → 部署 Api 栈。 |
-| GET, HEAD | `/static/{name}.js` | 公开只读。`name` 为单段 `*.js` 文件名（如 `app-storefront.js`、`patch-v2.js`）。**优先** Admin 上传至 DynamoDB 的内容；`app-storefront.js` 无上传时回退 `lambda/static/app-storefront.js`（内置版本见 `APP_STOREFRONT_VERSION`）。**`ETag`**、**`Cache-Control: public, max-age=3600, must-revalidate`**；`If-None-Match` → **304**。`app-config.js` 仍走上一行专用路由。 |
+| GET, HEAD | `/static/app-config.js` | **无 JWT / 无 HMAC**。Query **必填** `shop`（或别名 `shopId`）= `*.myshopify.com` 主机名。按店铺解析 **app-config 模板**（见下）并合并默认配置、`METADATA` 与 `storefront_config_json` 后，在 `/*__GWOFY_CONFIG_JSON__*/` 处注入 **`GWOFY_CONFIG` JSON**（`Content-Type: application/javascript`）。**模板解析顺序**：店铺 `app_config_script_name`（未配置则默认 **`app-config.js`**）→ 若 Dynamo 有对应 **`isAppConfig`** 上传则用之 → 否则 **`app-config.js`** 无上传时回退内置 **`lambda/static/app-config.kernel.js`**。`shopId` / `productHandle` / `supportedCurrencies` / `auth.isOpenForSP` 等服务端 derived 字段**不可**被模板或 `storefront_config_json` 覆盖。须 **`activation_status=ACTIVATED`**，否则 **403** `shop_not_activated`。绑定脚本不存在 → **404** `app_config_script_not_found`。响应头 **`X-Gwofy-Asset-Version`**（`APP_CONFIG_VERSION`）、**`ETag`**（含模板指纹 + 配置 hash）；**不下发** `Cache-Control`，**不支持** `If-None-Match` → 304。示例：`/static/app-config.js?shop=gwo-dev.myshopify.com`。**发版**：改 kernel / 默认 JSON → bump `APP_CONFIG_VERSION` → 部署 Api 栈。 |
+| GET, HEAD | `/static/{name}.js` | 公开只读。`name` 为单段 `*.js` 文件名（如 `app-storefront.js`、`patch-v2.js`）。**优先** Admin 上传至 DynamoDB 的内容；`app-storefront.js` 无上传时回退 `lambda/static/app-storefront.js`（内置版本见 `APP_STOREFRONT_VERSION`）。**`ETag`**、**`Cache-Control: public, max-age=3600, must-revalidate`**；`If-None-Match` → **304**。路径 **`app-config.js`** 不走本路由（无 `shop` 时不暴露上传模板）。 |
 
 **离线 token 自动补救**（所有上表 Session 路由，不含 `/api/cart-config` 与上表静态脚本）：若 `installation_status=OFFLINE_AUTH_EXPIRED`、缺少 `refresh_token_enc`、或 refresh 将在 **7** 天内过期（`OFFLINE_REFRESH_RECOVERY_WINDOW_DAYS`），后端用当前 Session Token 做 [token exchange](https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange) 换新 offline 对并恢复 **ACTIVE**（审计 `OFFLINE_TOKEN_SESSION_RECOVERY`）；关键失败 **401** `shopify_offline_auth_failed` / **502** `offline_token_recovery_failed`。
 
@@ -328,19 +331,19 @@ curl -X PUT "https://sp-prod.gwofy.com/admin/static-scripts/store1.js" \
 
 ### 管理员（Cognito JWT + 用户组）
 
-- **User Pool / App Client**：使用你们 **已存在的** Cognito User Pool。部署前必须设置 **`ADMIN_COGNITO_USER_POOL_ID`**（或 context `admin_cognito_user_pool_id`）。**`ADMIN_COGNITO_CLIENT_ID`**（或 `admin_cognito_client_id`）为 **可选**：若省略，Api 栈会通过 **Custom Resource** 在 Pool 内 **列出** 已有 clients，若无名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client 则 **创建**（`GenerateSecret=false`，常见浏览器登录流），并把得到的 **ClientId** 写入 JWT Authorizer 的 `aud` 与输出 `AdminCognitoUserPoolClientId`。若 Pool 不在 Api 栈所在 AWS 区域，再设 **`ADMIN_COGNITO_REGION`**（或 `admin_cognito_region`）。**仅缺少 User Pool ID 时** `cdk synth` / `deploy` 会报错。删除 CloudFormation 栈时 **不会** 删除该自动创建的 App Client（Delete 请求中不调用 Cognito 删除）。
+- **User Pool / App Client**：使用你们 **已存在的** Cognito User Pool。部署前必须设置 **`ADMIN_COGNITO_USER_POOL_ID`**（或 context `admin_cognito_user_pool_id`）。**`ADMIN_COGNITO_CLIENT_ID`**（或 `admin_cognito_client_id`）为 **可选**：若省略，Api 栈会通过 **Custom Resource** 在 Pool 内 **列出** 已有 clients，若无名为 **`GWO-SHIPPING-PROTECTION`** 的 App Client 则 **创建**（`GenerateSecret=false`，常见浏览器登录流），并把得到的 **ClientId** 作为 **主** JWT `aud` 与 `/auth/callback` 的 `COGNITO_CLIENT_ID`（栈输出 `AdminCognitoUserPoolClientId`）。**`ADMIN_COGNITO_CLIENT_IDS`**（或 `admin_cognito_client_ids`）为 **可选**：逗号/空格分隔的 **额外** App Client ID，同一 Pool 下由这些 Client 签发的 Id token 也可调 `/admin`（栈输出 `AdminCognitoUserPoolClientIds`）。若 Pool 不在 Api 栈所在 AWS 区域，再设 **`ADMIN_COGNITO_REGION`**（或 `admin_cognito_region`）。**仅缺少 User Pool ID 时** `cdk synth` / `deploy` 会报错。删除 CloudFormation 栈时 **不会** 删除该自动创建的 App Client（Delete 请求中不调用 Cognito 删除）。
 - 栈 **Outputs**：`AdminCognitoUserPoolId`、`AdminCognitoUserPoolClientId`、`AdminCognitoIssuer`、`AdminCognitoRegion`。用户与密码由 **你们既有身份平台** 管理。
 - 调用 `/admin/...` 时请求头使用 **`Authorization: Bearer <Cognito Id Token>`**（须含 `cognito:groups` 声明）。除 API Gateway 对 JWT 的签名校验外，Lambda 会要求调用者属于你们 **已存在的** 用户组 **`GWOFY-SHIPPING-PROTECTION`**（本栈 **不会** 创建该组；请在你们身份平台侧维护成员）。未入组返回 **403** `forbidden_not_in_admin_group`。
 - 可通过环境变量或 CDK context **`admin_cognito_group`** / `ADMIN_COGNITO_GROUP` 覆盖默认组名（一般保持 `GWOFY-SHIPPING-PROTECTION` 即可）。
 - **Cognito Hosted UI 回调**：`GET /auth/callback`（**无需** JWT）。浏览器从 Cognito **`/oauth2/authorize`** 授权后带 `?code=` 重定向至此；Lambda 向 Cognito **`/oauth2/token`** 换 token，默认返回 **HTML**（可复制 **Id token** 用于 `Authorization: Bearer`）；请求头 **`Accept: application/json`** 时返回 JSON。**回调 URL** 由 **`WEBHOOK_BASE_URL` + `/auth/callback`** 组成（须与 Cognito App Client 里配置的 Allowed callback URLs **完全一致**）。部署前还需设置 **`COGNITO_HOSTED_UI_DOMAIN`**（或 `-c cognito_hosted_ui_domain=`），值为 Cognito **域名前缀主机名**，例如 **`ap-east-1xxxx.auth.ap-east-1.amazoncognito.com`**（不要带 `https://`）。
-- 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience = `AdminCognitoUserPoolClientId`）：
+- 路由前缀 `/admin`（API Gateway JWT 校验 issuer + audience ∈ `AdminCognitoUserPoolClientIds`）：
   - `GET /admin/shops`（query：`status=ACTIVE`、`limit`、`cursor`）；列表项含 **`main_theme_gid`**（MAIN 主题 GID，主题同步或 `/api/me` live 拉取后写入）
   - `GET /admin/shops/{shop}`（`shop` 需 URL 编码；`shop` 对象内含 **`shop_enabled_currencies`** 解析数组，便于配置保额 UI）
   - `GET /admin/shops/{shop}/detail` — 与上一行相同返回完整 **`shop`** METADATA（**不脱敏**，含 `access_token_enc` 等，仅限可信管理环境）；并返回 **`merchantPremiumRules`**（解析自 `merchant_premium_rules_json`）。若存储 JSON 无效则 **`merchantPremiumRules`** 为默认空规则且可能带 **`merchant_premium_rules_parse_warning`**。
   - `POST /admin/tools/decrypt-shopify-token`，body：`{"access_token_enc":"<KMS Base64 密文>","kms_key_id":"<可选，缺省用 Lambda KMS_KEY_ID>","shop":"<可选，审计归属店铺 host；缺省为内部占位>"}` → **200** `{"ok":true,"access_token":"<明文 Shopify token>"}`（**极高敏感**，仅管理组；失败 **502** `decrypt_failed`；写审计 **`ADMIN_DECRYPT_SHOPIFY_TOKEN`**，**detail 不含明文**）
   - `POST /admin/shops/{shop}/features/return-insurance`、`.../shipping-protection`，body：`{"status":"CLOSED"|"OPEN_UNAUDITED"|"OPEN_AUDITED"}`
   - `POST /admin/shops/{shop}/suspend`、`.../resume`
-  - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`：商品/订单行含 **`payload`（JSON 快照）** 与顶栏筛选字段。商品含 **`product_handle`、`product_title`、`product_status`（Shopify 状态）、`price_min`/`price_max`、`variant_count`、`sync_deleted`、`deleted_at`**；订单含 **`order_name`、`legacy_resource_id`、`display_financial_status`、`display_fulfillment_status`、`current_total_price`（Decimal）、`sync_deleted`、`deleted_at`**。查询参数：`include_deleted=true` 含已删除镜像；商品可加 `product_handle_prefix`、`product_status`；订单可加 `financial_status`（与 `display_financial_status` 匹配）、`order_name_prefix`；原：`only_protection`、`tag`；`limit` 默认 100、最大 500。Webhook **`products/delete` / `orders/delete`** 会将对应 `PRODUCT#` / `ORDER#` 标为 `sync_deleted`（保留最后 `payload`）；**`markets/delete`** 触发重新拉 Markets 并 **修剪** `sp_market_rates_json` 中已不在市场的国家键。
+  - `GET /admin/shops/{shop}/products`、`GET /admin/shops/{shop}/orders`：商品/订单行含 **`payload`（JSON 快照）** 与顶栏筛选字段。商品含 **`product_handle`、`product_title`、`product_status`（Shopify 状态）、`price_min`/`price_max`、`variant_count`、`variant_skus`、`variant_barcodes`（含 ASIN/barcode）、`sync_deleted`、`deleted_at`**；订单含 **`order_name`、`legacy_resource_id`、`display_financial_status`、`display_fulfillment_status`、`current_total_price`（Decimal）、`order_created_at`、`order_processed_at`、`line_item_skus`、`has_shipping_protection`、`sync_tags`、`sync_deleted`、`deleted_at`**。分页：**`limit`**（默认 100、最大 500）、**`cursor`**（上一页响应的 `next_cursor`）。通用：`include_deleted=true` 含已删除镜像。商品筛选：`product_handle_prefix`、`product_title_prefix`、`product_status`、`sku`、`asin`（或 `barcode`）。订单筛选：`only_protection` / `has_shipping_protection`（含运费险）、`financial_status`、`fulfillment_status`、`order_name`（精确）、`order_name_prefix`、`legacy_resource_id` / `order_number`、`tag`、`sku`（行项目 SKU）、`created_from`/`created_to`、`processed_from`/`processed_to`、`updated_from`/`updated_to`（ISO8601）。**SKU/ASIN/日期等新索引字段需重新同步商品/订单后才会出现在旧镜像行上。** Webhook **`products/delete` / `orders/delete`** 会将对应 `PRODUCT#` / `ORDER#` 标为 `sync_deleted`（保留最后 `payload`）；**`markets/delete`** 触发重新拉 Markets 并 **修剪** `sp_market_rates_json` 中已不在市场的国家键。
   - `GET /admin/shops/{shop}/audit`（审计流水）
   - `GET /admin/config/supported-currencies` → `{"currencies":["USD","EUR",...]}`（管理员启用的币种，须为代码内允许列表的子集）
   - `PUT /admin/config/supported-currencies`，body：`{"currencies":["USD","EUR"]}`（非空、去重、大写存储）
@@ -355,9 +358,9 @@ curl -X PUT "https://sp-prod.gwofy.com/admin/static-scripts/store1.js" \
   - `GET /admin/config/calc-coverage-tips`、`PUT /admin/config/calc-coverage-tips`，body：`{"spBelowMinCoverageTip":"<字符串>","spGreaterMaxCoverageTip":"<字符串>"}` — **全局**购物车 **`calcInfo`** 保额提示文案（默认空串）
   - `GET /admin/shops/{shop}/calc-coverage-tips` → `global`、`shopOverride`（店铺是否覆盖）、`effective`（店铺请求 **`/api/cart-config`** 时实际下发）
   - `PUT /admin/shops/{shop}/calc-coverage-tips`，body 可只含其一或两项：`spBelowMinCoverageTip`、`spGreaterMaxCoverageTip`；值为 **`null`** 表示删除该字段覆盖并回退全局 — 与 **`POST /api/cart-config`** 里 **`calcInfo.spBelowMinCoverageTip` / `spGreaterMaxCoverageTip`** 同源（**已移除** `calcInfo` 中的 `spMaxCoverage`、`spMinCoverage`、`zeroBuyConf`，保额上限仍以 **`maxAmount`** 表示）
-  - `GET /admin/shops/{shop}/storefront-config` → `{ shop, defaults, derived, shopOverride, effective }` — 店面 `GWOFY_CONFIG` 预览；`effective` 为合并后的最终配置
-  - `PUT /admin/shops/{shop}/storefront-config`，body 为 **partial** 对象（写入 `storefront_config_json`）；`null` 删除覆盖项。**不可**通过本接口改 `shopId`、`productHandle`、`supportedCurrencies`、`auth.isOpenForSP`（分别由店铺域名 derived、激活商品的 handle、店铺已启用货币、`shipping_protection_status === OPEN_AUDITED` 管理；`OPEN_UNAUDITED` 时 `auth.isOpenForSP` 为 **false**）。**店面算价/保额**（`pricing.calcRate` 默认 **`0.04`**、`spMaxCoverage`、`hardMaxAmount`、`spMinCoverage`、保额提示文案等）**仅**在本接口 `pricing` 对象中配置，**不再**从 `shipping-calc-settings` / `calc-coverage-tips` 合并进 `app-config.js`（`POST /api/cart-config` 仍使用原运营字段，与店面脚本配置解耦）。**`remoteScriptUrls`**（字符串 URL 数组）可在此按店铺配置；未配置时 `app-config.js` 注入默认 **`["https://sp-prod.gwofy.com/static/app-storefront.js"]`**；可引用 Admin 上传脚本的 `{WEBHOOK_BASE_URL}/static/{name}.js`。
-  - `GET /admin/static-scripts` → `{ "scripts": [...] }`；`GET /admin/static-scripts/{name}` → 含 `source` 全文；`PUT /admin/static-scripts/{name}` → 新建 **201** / 更新 **200**（`confirmOverwrite`）；`DELETE /admin/static-scripts/{name}` — 见上文「Admin 全局 JS 管理」。
+  - `GET /admin/shops/{shop}/storefront-config` → `{ shop, defaults, scriptOverlay, derived, shopOverride, effective, appConfigScriptName, appConfigScripts }` — 店面 `GWOFY_CONFIG` 预览；`effective` 为合并后的最终配置；`appConfigScriptName` 为店铺 effective 模板名（默认 **`app-config.js`**）；`appConfigScripts` 为可选 **`isAppConfig`** 上传列表
+  - `PUT /admin/shops/{shop}/storefront-config`，body 为 **partial** 对象（写入 `storefront_config_json`）及/或 **`appConfigScriptName`**（绑定 **`isAppConfig`** 上传脚本名；**`null`** 清除绑定回退默认 **`app-config.js`**）；`null` 删除覆盖项。**不可**通过本接口改 `shopId`、`productHandle`、`supportedCurrencies`、`auth.isOpenForSP`（分别由店铺域名 derived、激活商品的 handle、店铺已启用货币、`shipping_protection_status === OPEN_AUDITED` 管理；`OPEN_UNAUDITED` 时 `auth.isOpenForSP` 为 **false**）。绑定不存在或非 app-config 脚本 → **400** `invalid_app_config_script`。**店面算价/保额**（`pricing.calcRate` 默认 **`0.04`**、`spMaxCoverage`、`hardMaxAmount`、`spMinCoverage`、保额提示文案等）**仅**在本接口 `pricing` 对象中配置，**不再**从 `shipping-calc-settings` / `calc-coverage-tips` 合并进 `app-config.js`（`POST /api/cart-config` 仍使用原运营字段，与店面脚本配置解耦）。**`remoteScriptUrls`**（字符串 URL 数组）可在此按店铺配置；未配置时 `app-config.js` 注入默认 **`["https://sp-prod.gwofy.com/static/app-storefront.js"]`**；可引用 Admin 上传脚本的 `{WEBHOOK_BASE_URL}/static/{name}.js`。
+  - `GET /admin/static-scripts` → `{ "scripts": [...], "nameRules": {...} }`；query **`isAppConfig=true`** 仅 app-config 脚本、**`false`** 仅普通脚本；带 filter 时响应含 **`isAppConfigFilter`**。`GET /admin/static-scripts/{name}` → 含 `source` 全文；`PUT /admin/static-scripts/{name}` → 新建 **201** / 更新 **200**（`confirmOverwrite`）；`DELETE /admin/static-scripts/{name}` — 见上文「Admin 全局 JS 管理」。
   - `PUT /admin/shops/{shop}/shipping-calc-settings`，body 可含其一或多项：`sp_max_coverage_usd`、`sp_market_rates`、**`sp_max_coverage_by_currency`**（不再接受 `sp_country_max_overrides`）
   - `POST /admin/shops/{shop}/sync-enabled-currencies` — 用店铺离线 token 拉取 Shopify 启用货币列表（与商户 **`POST /api/shop-enabled-currencies/sync`** 同源逻辑）
   - `POST /admin/shops/{shop}/sync` — **手动拉取/更新** 店铺镜像数据。Body：`{"resources":["all"]}` 或 `["shop_profile","products","orders","currencies","markets","catalog"]`（`catalog` = 商品+订单）；**`async`** 默认 **`true`**（入队 Worker，**202**）；**`false`** 时在 Admin Lambda 内同步执行（**29s** 超时，仅适合 profile/currencies/markets）。**`reset_checkpoints`**：`true` 时商品/订单全量从第一页重拉。同步模式成功 **200** / 部分失败 **502**，返回 **`steps`** 各资源结果。

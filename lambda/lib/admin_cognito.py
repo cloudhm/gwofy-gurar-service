@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 
@@ -15,6 +16,18 @@ def _normalize_group_name(name: str) -> str:
     return g
 
 
+def _split_group_tokens(text: str) -> list[str]:
+    """Split a group fragment on commas and/or whitespace (API GW sometimes joins groups with spaces)."""
+    return [_normalize_group_name(x) for x in re.split(r"[,\s]+", text.strip()) if x.strip()]
+
+
+def _groups_from_list_items(items: list[Any]) -> list[str]:
+    groups: list[str] = []
+    for item in items:
+        groups.extend(_split_group_tokens(str(item)))
+    return groups
+
+
 def _groups_from_groups_string(s: str) -> list[str]:
     """Parse cognito:groups when API GW passes a string (JSON array, pseudo-array, or CSV)."""
     s = s.strip()
@@ -24,16 +37,16 @@ def _groups_from_groups_string(s: str) -> list[str]:
         try:
             parsed = json.loads(s)
             if isinstance(parsed, list):
-                return [_normalize_group_name(str(x)) for x in parsed]
+                return _groups_from_list_items(parsed)
         except json.JSONDecodeError:
             pass
         # e.g. "[GWOFY-SHIPPING-PROTECTION]" (not valid JSON — tokens unquoted); strip brackets and split.
         if s.endswith("]"):
             inner = s[1:-1].strip()
             if inner:
-                return [_normalize_group_name(x) for x in inner.split(",") if x.strip()]
+                return _split_group_tokens(inner)
             return []
-    return [_normalize_group_name(x) for x in s.split(",") if x.strip()]
+    return _split_group_tokens(s)
 
 
 def cognito_groups_from_claims(claims: dict[str, Any]) -> list[str]:
@@ -42,7 +55,7 @@ def cognito_groups_from_claims(claims: dict[str, Any]) -> list[str]:
     if raw is None:
         raw = claims.get("cognito_groups")
     if isinstance(raw, list):
-        return [_normalize_group_name(str(x)) for x in raw]
+        return _groups_from_list_items(raw)
     if isinstance(raw, str):
         return _groups_from_groups_string(raw)
     return []

@@ -96,3 +96,26 @@ def resolve_deploy_urls(
         custom_domain_fqdn=fqdn,
         certificate_arn=cert,
     )
+
+
+def resolve_admin_cognito_jwt_audiences(
+    *,
+    primary_client_id: str,
+    extra_client_ids: str | None = None,
+) -> list[str]:
+    """Primary app client plus optional comma/space-separated extras (deduped, order preserved)."""
+    audiences: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        cid = raw.strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            audiences.append(cid)
+
+    add(primary_client_id)
+    extra = (extra_client_ids or "").strip()
+    if extra:
+        for part in re.split(r"[,\s]+", extra):
+            add(part)
+    return audiences

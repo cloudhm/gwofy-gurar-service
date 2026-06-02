@@ -127,3 +127,47 @@ def test_api_stack_custom_domain_with_route53_alias():
         "AWS::Route53::RecordSet",
         {"Name": "sp-prod.gwofy.com.", "Type": "A"},
     )
+
+
+def test_api_stack_jwt_audience_multiple_clients():
+    app = core.App(
+        context={
+            "admin_cognito_user_pool_id": "us-east-1_TestPoolForSynth123",
+            "admin_cognito_client_id": "client-primary",
+            "admin_cognito_client_ids": "client-extra1, client-extra2",
+        }
+    )
+    storage = StorageStack(app, "gwofy-guard-storage-multi-aud", stage="m1")
+    api = ApiStack(app, "gwofy-guard-api-multi-aud", storage=storage, stage="m1")
+    template = assertions.Template.from_stack(api)
+
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Authorizer",
+        {
+            "JwtConfiguration": {
+                "Audience": ["client-primary", "client-extra1", "client-extra2"],
+            },
+        },
+    )
+
+
+def test_api_stack_jwt_audience_extras_only_without_explicit_primary():
+    """Custom Resource ClientId is a token; extras must not be merged with it at synth (AWS rejects dup aud)."""
+    app = core.App(
+        context={
+            "admin_cognito_user_pool_id": "us-east-1_TestPoolForSynth123",
+            "admin_cognito_client_ids": "client-extra1, client-extra2",
+        }
+    )
+    storage = StorageStack(app, "gwofy-guard-storage-extras-only", stage="m2")
+    api = ApiStack(app, "gwofy-guard-api-extras-only", storage=storage, stage="m2")
+    template = assertions.Template.from_stack(api)
+
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Authorizer",
+        {
+            "JwtConfiguration": {
+                "Audience": ["client-extra1", "client-extra2"],
+            },
+        },
+    )

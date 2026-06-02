@@ -21,6 +21,32 @@ def test_parse_cognito_groups_bracket_string_two_groups():
     assert "GWOFY-SHIPPING-PROTECTION" in g and "GWOFY-ADMIN" in g
 
 
+def test_parse_cognito_groups_space_separated_string():
+    claims = {"cognito:groups": "GWOFY-ADMIN GWOFY-SHIPPING-PROTECTION"}
+    g = cognito_groups_from_claims(claims)
+    assert "GWOFY-SHIPPING-PROTECTION" in g and "GWOFY-ADMIN" in g
+
+
+def test_parse_cognito_groups_bracket_string_space_separated():
+    claims = {"cognito:groups": "[GWOFY-ADMIN GWOFY-SHIPPING-PROTECTION]"}
+    g = cognito_groups_from_claims(claims)
+    assert "GWOFY-SHIPPING-PROTECTION" in g and "GWOFY-ADMIN" in g
+
+
+def test_parse_cognito_groups_list_single_space_joined_element():
+    claims = {"cognito:groups": ["GWOFY-ADMIN GWOFY-SHIPPING-PROTECTION"]}
+    g = cognito_groups_from_claims(claims)
+    assert "GWOFY-SHIPPING-PROTECTION" in g and "GWOFY-ADMIN" in g
+
+
+def test_require_group_ok_with_multiple_groups():
+    os.environ["ADMIN_COGNITO_GROUP"] = "GWOFY-SHIPPING-PROTECTION"
+    ok, req = admin_in_required_group(
+        {"cognito:groups": ["GWOFY-ADMIN GWOFY-SHIPPING-PROTECTION"], "sub": "x"}
+    )
+    assert ok and req == "GWOFY-SHIPPING-PROTECTION"
+
+
 def test_parse_cognito_groups_list():
     claims = {"cognito:groups": ["GWOFY-SHIPPING-PROTECTION"]}
     assert cognito_groups_from_claims(claims) == ["GWOFY-SHIPPING-PROTECTION"]

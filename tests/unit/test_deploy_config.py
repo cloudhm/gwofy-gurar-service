@@ -1,6 +1,11 @@
 import pytest
 
-from gwofy_guard_service.deploy_config import normalize_https_base, resolve_deploy_urls, suggested_custom_fqdn
+from gwofy_guard_service.deploy_config import (
+    normalize_https_base,
+    resolve_admin_cognito_jwt_audiences,
+    resolve_deploy_urls,
+    suggested_custom_fqdn,
+)
 
 
 def test_suggested_custom_fqdn():
@@ -56,4 +61,22 @@ def test_resolve_strict_mismatch():
             webhook_base_url_ctx=None,
             strict_deploy_config=True,
         )
+
+
+def test_resolve_admin_cognito_jwt_audiences_primary_only():
+    assert resolve_admin_cognito_jwt_audiences(primary_client_id="abc") == ["abc"]
+
+
+def test_resolve_admin_cognito_jwt_audiences_with_extras():
+    assert resolve_admin_cognito_jwt_audiences(
+        primary_client_id="abc",
+        extra_client_ids="xyz, def  ghi",
+    ) == ["abc", "xyz", "def", "ghi"]
+
+
+def test_resolve_admin_cognito_jwt_audiences_dedupes():
+    assert resolve_admin_cognito_jwt_audiences(
+        primary_client_id="abc",
+        extra_client_ids="abc, xyz",
+    ) == ["abc", "xyz"]
 

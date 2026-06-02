@@ -2,14 +2,19 @@
 
 import pytest
 
-from lib.static_scripts import script_name_rules, validate_script_name
+from lib.static_scripts import (
+    script_name_rules,
+    validate_app_config_source,
+    validate_script_name,
+)
 
 
 def test_script_name_rules_documented():
     rules = script_name_rules()
-    assert "app-config.js" in rules["reservedNames"]
+    assert "app-config.js" in rules["examplesValid"]
     assert "store1.js" in rules["examplesValid"]
     assert "店铺.js" in rules["examplesInvalid"]
+    assert "reservedNames" not in rules
 
 
 @pytest.mark.parametrize(
@@ -17,6 +22,7 @@ def test_script_name_rules_documented():
     [
         "store1.js",
         "patch-v2.js",
+        "app-config.js",
         "app.storefront.js",
         "A1_b-2.js",
     ],
@@ -28,8 +34,6 @@ def test_valid_names(name):
 @pytest.mark.parametrize(
     "name,expected_code",
     [
-        ("app-config.js", "script_name_reserved"),
-        ("APP-CONFIG.JS", "script_name_reserved"),
         ("store 1.js", "script_name_whitespace"),
         ("store\t1.js", "script_name_whitespace"),
         ("店铺.js", "script_name_non_ascii"),
@@ -43,3 +47,15 @@ def test_valid_names(name):
 def test_invalid_names(name, expected_code):
     with pytest.raises(ValueError, match=expected_code):
         validate_script_name(name)
+
+
+def test_validate_app_config_source_accepts_literal_assignment():
+    validate_app_config_source("g.GWOFY_CONFIG = { debug: true };")
+    validate_app_config_source("g.GWOFY_CONFIG = Object.assign({}, /*__GWOFY_CONFIG_JSON__*/);")
+
+
+def test_validate_app_config_source_rejects_missing_assignment():
+    with pytest.raises(ValueError, match="app_config_missing_gwofy_config"):
+        validate_app_config_source("// empty")
+    with pytest.raises(ValueError, match="app_config_missing_gwofy_config_assignment"):
+        validate_app_config_source("var x = g.GWOFY_CONFIG;")
